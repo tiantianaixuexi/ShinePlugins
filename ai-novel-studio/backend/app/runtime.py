@@ -13,6 +13,7 @@ from app.core.logging import get_logger
 from app.db.migrations import read_version
 from app.db.project_db import ProjectDatabaseRegistry
 from app.db.session import Database
+from app.services.agent_config_service import AgentConfigService
 from app.services.ai_service import AIService
 from app.services.model_config_service import ModelConfigService, ensure_default_model
 from app.services.project_service import ProjectService
@@ -35,12 +36,14 @@ class Runtime:
             self.projects,
         )
         self.model_configs = ModelConfigService(self.studio_db, self.settings.data_dir)
+        self.agent_configs = AgentConfigService(self.studio_db)
         self.prompts = PromptService(self.studio_db)
         self.ai = AIService(
             self.studio_db,
             self.project_service,
             self.model_configs,
             self.prompts,
+            self.agent_configs,
         )
         self._started = False
 

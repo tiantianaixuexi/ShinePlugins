@@ -32,7 +32,7 @@ from app.core.logging import configure_logging  # noqa: E402
 from app.runtime import Runtime  # noqa: E402
 from app.schemas.ai import AIRequest  # noqa: E402
 from app.schemas.model_config import ModelConfigCreate  # noqa: E402
-from app.schemas.novel import ChapterCreate  # noqa: E402
+from app.schemas.novel import ChapterAcceptAi, ChapterCreate  # noqa: E402
 from app.schemas.project import ProjectCreate  # noqa: E402
 from app.services.novel_service import NovelService  # noqa: E402
 
@@ -51,6 +51,21 @@ def check(label: str, condition: bool, detail: str = "") -> None:
     if not condition:
         failures += 1
     print(f"[{'PASS' if condition else 'FAIL'}] {label}" + (f"  ({detail})" if detail and not condition else ""))
+
+
+def spend_line(runtime: Runtime, project_id: str, kind: str, elapsed: float) -> None:
+    """Print wall time plus the token usage of the newest task of *kind*."""
+    task = next(
+        (item for item in runtime.ai.list_tasks(project_id=project_id) if item.kind == kind),
+        None,
+    )
+    if task is None:
+        print(f"  耗时 {elapsed:.1f}s · 未找到任务记录（{kind}）")
+        return
+    print(
+        f"  耗时 {elapsed:.1f}s · 输入 {task.input_tokens} token · "
+        f"输出 {task.output_tokens} token · cost={task.cost}"
+    )
 
 
 async def main_async(args: argparse.Namespace) -> int:
@@ -199,9 +214,93 @@ async def main_async(args: argparse.Namespace) -> int:
             print(f"    {line}")
         print()
 
-        # 3. Task ledger ---------------------------------------------------
+        # 3. Chapter summary (L1 memory) ------------------------------------
+        print("→ 章节摘要（L1）…")
+        started = time.perf_counter()
+        try:
+            summary = await runtime.ai.summarize_chapter(
+                project.id, chapter.id, force=True, model_config_id=model.id
+            )
+        except (LLMAdapterError, StudioError) as exc:
+            check("摘要调用成功", False, str(exc))
+            return 1
+        elapsed = time.perf_counter() - started
+        summary_text = (summary.get("summary") or "").strip()
+        check("摘要非空", bool(summary_text), str(summary)[:160])
+        check("首次摘要未走缓存", summary.get("cached") is False, str(summary)[:160])
+        spend_line(runtime, project.id, "ai.summary", elapsed)
+        print("  摘要预览：")
+        for line in summary_text.splitlines()[:3]:
+            print(f"    {line}")
+        print()
+
+        started = time.perf_counter()
+        cached_summary = await runtime.ai.summarize_chapter(
+            project.id, chapter.id, model_config_id=model.id
+        )
+        cached_elapsed = time.perf_counter() - started
+        check("二次摘要命中缓存", cached_summary.get("cached") is True, str(cached_summary)[:160])
+        check("缓存摘要与首次一致", cached_summary.get("summary") == summary.get("summary"))
+        print(f"  缓存命中耗时 {cached_elapsed:.2f}s（未调用模型）\n")
+
+        # 4. Structured outline, persisted -----------------------------------
+        print("→ 章节大纲（落库）…")
+        started = time.perf_counter()
+        try:
+            outline = await runtime.ai.generate_outline(
+                project.id, chapter.id, force=True, model_config_id=model.id
+            )
+        except (LLMAdapterError, StudioError) as exc:
+            check("大纲调用成功", False, str(exc))
+            return 1
+        elapsed = time.perf_counter() - started
+        check("大纲已落库", bool(outline.get("outline_id")), str(outline)[:160])
+        check("大纲挂在当前章节下", outline.get("parent_id") == chapter.id, str(outline.get("parent_id")))
+        check("大纲层级为 chapter", outline.get("level") == "chapter", str(outline.get("level")))
+        if outline.get("degraded"):
+            # A real model sometimes answers in prose instead of JSON. That is
+            # acceptable, but the raw reply must still be stored.
+            check(
+                "降级大纲保留了原文",
+                bool((outline.get("content") or "").strip()),
+                str(outline)[:160],
+            )
+        else:
+            check("大纲标题非空", bool((outline.get("title") or "").strip()), str(outline)[:160])
+        spend_line(runtime, project.id, "ai.outline.structured", elapsed)
+        print(f"  degraded={outline.get('degraded')} · 标题：{outline.get('title') or '（空）'}")
+        print()
+
+        # 5. Accept AI text, keeping the blood-line --------------------------
+        print("→ 采纳 AI 正文（血缘）…")
+        started = time.perf_counter()
+        accepted_text = result.text.strip()
+        accepted = NovelService(runtime.project_service).accept_ai(
+            project.id,
+            chapter.id,
+            ChapterAcceptAi(
+                content=accepted_text,
+                task_id=result.task_id,
+                note="AI 冒烟测试",
+            ),
+        )
+        elapsed = time.perf_counter() - started
+        check("采纳版本来源为 ai", accepted.version.source == "ai", accepted.version.source)
+        check(
+            "采纳版本携带 task_id",
+            accepted.version.task_id == result.task_id,
+            f"{accepted.version.task_id} != {result.task_id}",
+        )
+        check(
+            "章节正文已换成 AI 文本",
+            accepted.chapter.content == accepted_text,
+            f"{len(accepted.chapter.content or '')} != {len(accepted_text)} 字",
+        )
+        print(f"  耗时 {elapsed:.2f}s · 版本 v{accepted.version.version_no} · {accepted.chapter.word_count} 字\n")
+
+        # 6. Task ledger ---------------------------------------------------
         tasks = runtime.ai.list_tasks(project_id=project.id)
-        check("任务已记账", len(tasks) >= 2, f"{len(tasks)} 条")
+        check("任务已记账", len(tasks) >= 4, f"{len(tasks)} 条")
         for task in tasks:
             print(
                 f"  {task.kind:<16} {task.status:<8} in={task.input_tokens:<5} "

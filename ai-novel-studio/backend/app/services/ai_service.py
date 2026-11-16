@@ -33,6 +33,7 @@ from app.db.session import Database
 from app.models.novel import Chapter, ChapterSummary, Outline
 from app.models.studio import GenerationTask, ModelConfig
 from app.schemas.ai import AIRequest, AIResult
+from app.services.agent_config_service import AgentConfigService
 from app.services.model_config_service import ModelConfigService
 from app.services.novel_service import NovelService
 from app.services.project_service import ProjectService
@@ -162,13 +163,43 @@ class AIService:
         projects: ProjectService,
         model_service: ModelConfigService,
         prompts: PromptService,
+        agent_configs: AgentConfigService,
     ) -> None:
         self.studio_db = studio_db
         self.projects = projects
         self.model_service = model_service
         self.prompts = prompts
+        self.agent_configs = agent_configs
         self.novels = NovelService(projects)
         self.chat = ChatClient(model_service)
+
+    # ------------------------------------------------------------------
+    # Model resolution
+    # ------------------------------------------------------------------
+    def _resolve_model(self, operation: str, model_config_id: str | None) -> ModelConfig:
+        """Pick the model for one call. **The only** resolution path.
+
+        Precedence: the request's explicit id beats the per-agent binding, which
+        beats the writer's default model. A binding to a deleted / disabled model
+        degrades to the default (with a log line) rather than failing the call —
+        the author's chapter still gets written.
+        """
+        if model_config_id:
+            return self.chat.resolve(model_config_id)
+
+        agent = self.agent_configs.resolve_for_operation(operation)
+        if agent is not None and agent.model_config_id:
+            try:
+                return self.chat.resolve(agent.model_config_id)
+            except (NotFound, ValidationFailed) as exc:
+                logger.warning(
+                    "agent_model_unavailable",
+                    operation=operation,
+                    agent_type=agent.agent_type,
+                    model_config_id=agent.model_config_id,
+                    error=str(exc),
+                )
+        return self.chat.resolve(None)
 
     # ------------------------------------------------------------------
     # Public API
@@ -183,7 +214,7 @@ class AIService:
 
     async def run(self, operation: str, payload: AIRequest) -> AIResult:
         self.validate_operation(operation)
-        model = self.chat.resolve(payload.model_config_id)
+        model = self._resolve_model(operation, payload.model_config_id)
         variables = self._build_variables(operation, payload, model)
         messages, prompt_key, missing = self.prompts.render_for(operation, variables)
         if missing:
@@ -218,7 +249,7 @@ class AIService:
 
     async def stream(self, operation: str, payload: AIRequest) -> AsyncIterator[AIStreamEvent]:
         self.validate_operation(operation)
-        model = self.chat.resolve(payload.model_config_id)
+        model = self._resolve_model(operation, payload.model_config_id)
         variables = self._build_variables(operation, payload, model)
         messages, prompt_key, missing = self.prompts.render_for(operation, variables)
         if missing:
@@ -316,7 +347,7 @@ class AIService:
         if existing is not None and existing.summary and not force:
             return {"chapter_id": chapter_id, "summary": existing.summary, "cached": True}
 
-        model = self.chat.resolve(model_config_id)
+        model = self._resolve_model("summary", model_config_id)
         messages, missing = self._summary_messages(chapter.title, content, model)
         if missing:
             logger.warning(
@@ -439,7 +470,7 @@ class AIService:
         if existing is not None and not force and (existing["content"] or existing["goal"]):
             return existing
 
-        model = self.chat.resolve(model_config_id)
+        model = self._resolve_model("outline_persist", model_config_id)
         messages, missing = self._outline_messages(project, chapter, instruction)
         if missing:
             logger.warning(
