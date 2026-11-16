@@ -9,8 +9,10 @@ sentence of prose. So the flow here is:
 1. parse the reply with :func:`parse_json_object` (direct → de-fenced → brace span),
 2. if that fails and retries remain, append the offending reply plus a repair
    instruction and ask once more,
-3. if it still fails, hand back ``None`` together with the raw text so the
-   caller can degrade to non-structured extraction instead of failing the task.
+3. if it still fails, hand back ``None`` together with the **longest** raw text
+   seen so far — a truncated JSON body is still worth more to the author than
+   the empty string a repair turn sometimes answers with — so the caller can
+   degrade to non-structured extraction instead of failing the task.
 
 This module is deliberately free of service-layer imports so both the summary
 writer and any future structured operation can share it.
@@ -91,12 +93,32 @@ def _brace_span(text: str) -> str:
     return text[start : end + 1]
 
 
+def longest_text(*candidates: str) -> str:
+    """Return whichever candidate carries the most non-blank text.
+
+    Used by every degradation path: when a repair turn answers with ``""`` (or
+    with less prose than the first attempt) the reply the author already paid
+    for must not be thrown away. Blank candidates never win, so the result is
+    ``""`` only when *every* attempt was blank.
+    """
+    best = ""
+    best_size = 0
+    for candidate in candidates:
+        text = candidate or ""
+        size = len(text.strip())
+        if size > best_size:
+            best, best_size = text, size
+    return best
+
+
 @dataclass(slots=True)
 class StructuredReply:
     """Outcome of :func:`complete_json`.
 
     ``data`` is ``None`` when every attempt failed to produce a JSON object, in
-    which case ``text`` holds the last raw reply for the caller to degrade on.
+    which case ``text`` holds the **longest** raw reply from any attempt (never
+    a blank repair turn when the first attempt did say something) for the caller
+    to degrade on. When an attempt parses, ``text`` is that attempt's reply.
     Unpacks as ``(data, text)``; ``usage`` and ``attempts`` stay reachable as
     attributes so token accounting covers the repair call too.
     """
@@ -127,11 +149,16 @@ async def complete_json(
     ``request.json_mode`` is switched on here; the adapter decides whether the
     provider actually supports it, so this is safe for models without the
     capability (they just get the prompt-level instruction).
+
+    The returned ``text`` is never blank when any attempt produced text: on
+    total failure it is the longest reply seen, not merely the last one (see
+    :func:`longest_text`).
     """
     request.json_mode = True
     messages = list(request.messages)
     usage = LLMUsage()
     attempts = 0
+    raw = ""
 
     while True:
         request.messages = messages
@@ -143,9 +170,15 @@ async def complete_json(
         )
 
         data = parse_json_object(response.text)
-        if data is not None or attempts > retries:
+        if data is not None:
+            # The reply that parsed wins: callers re-derive fields from it.
             return StructuredReply(
                 data=data, text=response.text, usage=usage, attempts=attempts
+            )
+        raw = longest_text(raw, response.text)
+        if attempts > retries:
+            return StructuredReply(
+                data=None, text=raw, usage=usage, attempts=attempts
             )
 
         messages = [

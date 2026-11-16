@@ -45,8 +45,16 @@ class MockProvider:
 
     def __init__(self) -> None:
         self.reply = ""
+        #: When non-empty, the n-th request gets ``replies[n]`` (last one repeats);
+        #: lets a test script "first attempt" and "repair attempt" separately.
+        self.replies: list[str] = []
         self.requests: list[dict[str, Any]] = []
         self.url = ""
+
+    def next_reply(self) -> str:
+        if not self.replies:
+            return self.reply
+        return self.replies[min(len(self.requests) - 1, len(self.replies) - 1)]
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -60,7 +68,7 @@ class _Handler(BaseHTTPRequestHandler):
             {
                 "model": "mock-model",
                 "choices": [
-                    {"message": {"content": provider.reply}, "finish_reason": "stop"}
+                    {"message": {"content": provider.next_reply()}, "finish_reason": "stop"}
                 ],
                 "usage": {"prompt_tokens": 40, "completion_tokens": 20},
             },
@@ -249,6 +257,35 @@ def test_non_json_reply_degrades_and_keeps_raw_text(
     assert rows[0].title == CHAPTER_TITLE
     assert rows[0].level == "chapter"
     assert rows[0].parent_id == chapter_id
+
+
+def test_truncated_reply_with_blank_repair_still_degrades_with_content(
+    client: TestClient, auth: dict[str, str], provider: MockProvider
+) -> None:
+    """Truncated JSON + an empty repair turn: degraded, but ``content`` is the reply.
+
+    This is the shape a real run produced (``smoke_ai.py`` step 4 failed with
+    ``degraded=True`` and ``content=""``): the reply the author paid for must
+    survive even though neither turn was valid JSON.
+    """
+    truncated = '{"title": "铜铃响起的那一夜", "goal": "沈砚拿到铜铃并意识到它'
+    provider.replies = [truncated, ""]
+    project_id, chapter_id, _ = _seed(client, auth, provider.url)
+
+    response = client.post(
+        f"/api/ai/outline/{chapter_id}",
+        json={"project_id": project_id},
+        headers=auth,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["degraded"] is True
+    assert body["content"] == truncated, "降级时 content 不能为空"
+    assert body["title"] == CHAPTER_TITLE
+
+    rows = _outline_rows(client, project_id)
+    assert len(rows) == 1
+    assert rows[0].content == truncated
 
 
 def test_unknown_chapter_returns_404(

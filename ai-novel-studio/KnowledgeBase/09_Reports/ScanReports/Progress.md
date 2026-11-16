@@ -6,8 +6,8 @@ status: 现行（每轮更新）
 
 # 进度（唯一真源）
 
-- 最后更新：2026-11-16（知识库分区补全：新建 00_Project / 01_CodeMap / 04_BugsAndLessons / 09_Reports）
-- 基线 commit：本仓库**非 git 仓库**，无法用 commit 定位；文件时间戳为准。
+- 最后更新：2026-11-16 18:16（同步另一会话推进后的账本与基线：T-30/31/34/35/36/37 已关闭，T-33 在办；基线 pytest 117 / pnpm 37）
+- 基线 commit：`21d5595`（2026-11-16 17:47，main...origin/main）。**本仓库是 git 仓库**，根在 `e:\ShinePlugins`，开工/收尾用 `git status`/`git log` 核对他人改动。
 
 ## §0 AI 接手须知（每次开工先读）
 
@@ -22,16 +22,16 @@ status: 现行（每轮更新）
 | 5 | `../../05_Plan/TaskRegister.md`（用 `task_queue.py row/pick`，不读全文） | 待办真源 |
 | 6 | 只在要改某模块时读对应 `01_CodeMap/` 清单 + `02_Modules` | — |
 
-**当前状态一行**：阶段 2 P0 收口完成；待办 19（P1 13/P2 6），在办 T-30；知识库分区已补全为 8 个（除 03_ADR/08_AI_Memory 待建）。
+**当前状态一行**（截至 2026-11-16 18:16，队列数字是流动快照，实时值跑 `task_queue.py stats`）：总计 37 / 待办 16（P1 10 / P2 6）/ 已关闭 21；在办 T-33。阶段 3 RAG、阶段 4 工作流未开工。知识库分区已补全（除 03_ADR/08_AI_Memory 待建）。
 
-**下一件事**：等 T-30 租约释放后跑 `/task-next` 清队列；优先修 `DefectRegister.md` 的 DEF-01/02/03（摘要泄漏/回填不全/降级空内容）。
+**下一件事**：T-33 租约在办，task-next 会硬停；等其释放后跑 `/task-next` 清剩余待办。`DefectRegister.md` 待修只剩 DEF-01（摘要泄漏未来章 = T-33，正在进行）、DEF-02（摘要回填不全 = T-12）；DEF-03 已随 T-35 关闭。
 
 **口径与纪律**：
 1. 文档与代码不符 → 改文档（代码为准），冲突登记到本页 §4。
 2. 新增结论带 `文件:行` 或「命令+输出」；推断标 △，不确定标 ❓。
 3. 缺陷只写 `DefectRegister.md`（DEF-xx）；事实型文档最多留 `→ DEF-xx`。
 4. 未实现功能写 T-xx，不写 DEF。
-5. 改文件前先 `read_file`（非 git + 并行改动，见 `Lessons.md` L-06）。
+5. 改文件前先 `read_file` + 开工前 `git status`（并行会话改同一文件，见 `Lessons.md` L-06）。
 
 ## §1 阶段状态
 
@@ -55,23 +55,23 @@ status: 现行（每轮更新）
 | `05_Plan/` | ✅ 现行 | 8（含本次新建 TaskPitfalls） |
 | `09_Reports/ScanReports/` | ✅ 本次新建 | 2（本页 / InitialScan） |
 
-## §3 验证基线（2026-11-16 实测，唯一权威）
+## §3 验证基线（2026-11-16 18:16 实测，唯一权威）
 
-| 命令 | 实测 | 旧文档冲突 |
+| 命令 | 实测 | 命令细节 |
 |---|---|---|
-| pytest -q（backend） | **104 passed** | CurrentStatus 96 / INDEX 60 / README 60 |
-| pnpm test（desktop） | **36 passed (5 文件)** | AGENTS 29 / INDEX 29 / CurrentStatus 32 / README 349 写 29、384 写 25 |
-| pnpm typecheck | 干净 | — |
-| smoke_api / smoke_ai / cargo check | 本次未跑 | — |
+| pytest（backend） | **117 passed in 55.45s** | `python -m pytest -o addopts='' -q --tb=no`（叠加 -q 会静默到无汇总行） |
+| pnpm test（desktop） | **37 passed (5 文件)**：utils 14 · ai 10 · text-edit 6 · api 4 · sidecar 3 | `pnpm test` |
+| pnpm typecheck | 干净（`tsc --noEmit` 无输出） | `pnpm typecheck` |
+| smoke_api / smoke_ai / cargo check | 本轮未跑 | 另一会话 T-36 验证栏记 smoke_api PASSED、smoke_ai PASSED（真实模型） |
 
-> 待办：统一 `AGENTS.md`、`CODEBUDDY.md`、`INDEX.md`、`CurrentStatus.md`、`README.md` 的数字（改约定须 AGENTS+CODEBUDDY 两边一起改）。
+> **数字持续变化**：另一会话仍在推进（T-33 在办），测例随任务增加。本页是快照；改约定类文档（`AGENTS.md`/`CODEBUDDY.md`）需两边一起改，当前其期望值（pytest 全绿 / pnpm 29）仍是旧描述，但"全绿/无输出"的判据未变。
 
 ## §4 未解决问题 / 冲突登记
 
 | # | 问题 | 证据 | 处理 |
 |---|---|---|---|
-| 1 | 验证数字三处以上不一致 | §3 | 已记本页；待统一各方文档 |
-| 2 | T-30 租约在办（17:10:27），task-next 硬停 | `.agents/task-state.json` | 等释放或确认后 release |
-| 3 | 账本部分条目标"待办"但代码已实现（T-30 流式、T-34 reset、T-35） | `TaskPitfalls.md` + 取证 | t-next 分诊时按 false-positive 复核/park |
-| 4 | TaskPitfalls 部分 `文件:行` 路径写错（写成 `app/ai/services/`，真实 `app/services/`） | 本次取证 | 已在 DefectRegister/Lessons 用正确路径；TaskPitfalls 待订正 |
+| 1 | 验证数字多方不一致（本页 117/37；CurrentStatus 96/32；INDEX 60→已同步为实测；README 多处旧值） | §3 | 已记本页为权威；改数字类文档按需同步，约定类（AGENTS/CODEBUDDY）判据是"全绿"不需改数 |
+| 2 | T-33 租约在办（18:10:03），task-next 会硬停 | `.agents/task-state.json` | 等释放后跑 `/task-next` |
+| 3 | 原"待办却已实现"项已消解：T-30/34/35 均已关闭 | `TaskRegister.md` 已关闭区 | 无需 park；TaskPitfalls 订正横幅已标注 |
+| 4 | TaskPitfalls 部分 `文件:行` 路径写错（写成 `app/ai/services/`，真实 `app/services/`） | 本次取证 | 已加订正横幅；DefectRegister/Lessons 用正确路径 |
 | 5 | T-22/T-23 设计取舍缺独立 ADR | 03_ADR 待建 | 补 ADR 时从 TaskRegister 迁入 |

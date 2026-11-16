@@ -46,7 +46,9 @@ export function useChapterDraft(projectId: string, chapter: Chapter): ChapterDra
   const stateRef = useRef({ title: chapter.title, content: chapter.content });
   stateRef.current = { title, content };
 
-  const flush = useCallback(async () => {
+  const inflight = useRef<Promise<void> | null>(null);
+
+  const runSave = useCallback(async () => {
     if (!dirty.current) return;
     dirty.current = false;
     setSaveState("saving");
@@ -76,6 +78,21 @@ export function useChapterDraft(projectId: string, chapter: Chapter): ChapterDra
       toast.error("保存失败", { description: errorMessage(error) });
     }
   }, [chapter.id, projectId, queryClient]);
+
+  // Resolves only once the server has acknowledged — including a save that was
+  // already in flight when the caller asked (the summary trigger needs exactly
+  // that guarantee). A second concurrent PUT for the same `row_version` would 409.
+  const flush = useCallback(async () => {
+    if (inflight.current) await inflight.current;
+    if (!dirty.current) return;
+    const task = runSave();
+    inflight.current = task;
+    try {
+      await task;
+    } finally {
+      if (inflight.current === task) inflight.current = null;
+    }
+  }, [runSave]);
 
   const markDirty = useCallback(() => {
     dirty.current = true;

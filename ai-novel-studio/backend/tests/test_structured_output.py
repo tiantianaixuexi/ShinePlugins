@@ -134,6 +134,38 @@ async def test_non_json_reply_fails_after_one_repair_attempt() -> None:
     assert repaired[-1] == ChatMessage(role="user", content=REPAIR_INSTRUCTION)
 
 
+async def test_truncated_reply_survives_a_blank_repair_turn() -> None:
+    """A repair turn that answers ``""`` must not swallow the first attempt.
+
+    Real models truncate at ``max_tokens`` and then answer the repair prompt
+    with nothing at all; the caller stores ``text`` as the degraded ``content``,
+    so returning the blank repair reply would lose the whole paid reply.
+    """
+    truncated = '{"title": "铜铃响起的那一夜", "goal": "沈砚拿到铜铃并意识到它'
+    client = FakeClient(truncated, "")
+
+    reply = await complete_json(client, make_request())
+    data, text = reply
+
+    assert data is None, "截断的 JSON 解析不出来"
+    assert text == truncated, "修复轮空串时必须回退到首轮原文"
+    assert reply.attempts == 2
+    assert len(client.requests) == 2
+
+
+async def test_parsing_repair_reply_wins_over_a_longer_first_attempt() -> None:
+    """When the repair parses, ``text`` is the repair's reply — not the longer junk."""
+    junk = "好的，我先把大纲写成散文说明一下：" + "雨夜书店的相遇、" * 3
+    client = FakeClient(junk, '{"goal": "拿到铜铃"}')
+
+    reply = await complete_json(client, make_request())
+    data, text = reply
+
+    assert data == {"goal": "拿到铜铃"}
+    assert text == '{"goal": "拿到铜铃"}', "解析成功的那一轮原文优先"
+    assert len(junk) > len(text), "首轮原文更长，但解析成功的一轮胜出"
+
+
 def test_parse_json_object_rejects_arrays_and_garbage() -> None:
     assert parse_json_object('["a", "b"]') is None
     assert parse_json_object("完全没有 JSON") is None

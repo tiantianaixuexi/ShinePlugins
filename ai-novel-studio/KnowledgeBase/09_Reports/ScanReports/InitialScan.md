@@ -31,4 +31,5 @@ status: 归档（历史快照）
 - `01_CodeMap/`：6 篇（导航 + 三层文件清单 + 调用链）
 - `04_BugsAndLessons/`：3 篇（缺陷真源 + 教训）
 - `09_Reports/ScanReports/`：2 篇（本页 + Progress）
-- 后续待办：更新 `INDEX.md` / `05_Plan/README.md` 分区表、统一验证数字、补 `03_ADR`。
+- 后续待办：补 `03_ADR`（T-22 WS→SSE、T-23 Tiptap→textarea 两项设计取舍待迁入）。
+- 已完成（2026-11-16 18:16）：INDEX/05_Plan README 分区表已更新；验证数字权威统一到 [`Progress.md` §3](Progress.md)（当前 pytest 117 / pnpm 37）；账本推进后的状态已同步到 DefectRegister 与 TaskPitfalls。

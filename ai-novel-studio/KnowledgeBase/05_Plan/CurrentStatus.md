@@ -61,13 +61,13 @@ status: 现行（每轮更新）
 
 ## 5. 验收基线
 
-| 命令 | 期望 | 最近结果（2026-11-16 实跑） |
+| 命令 | 期望 | 最近结果（2026-11-16 18:16 快照） |
 |---|---|---|
-| `pytest -q`（backend） | 全绿 | ✅ `96 passed`（2026-11-16 晚，T-01…T-06 落地后；原 60 基线 + 36 条新用例） |
-| `pnpm test`（desktop） | 全绿 | ✅ `Tests 32 passed (32)` / 5 个文件 |
-| `pnpm typecheck` | 无输出 | 待跑 |
-| `scripts/smoke_api.py` | `SMOKE PASSED` | 待跑 |
-| `scripts/smoke_ai.py --from-store` | `AI SMOKE PASSED` | 待跑（需已配置模型） |
+| `pytest`（backend） | 全绿 | ✅ `117 passed`（`-o addopts='' -q --tb=no`） |
+| `pnpm test`（desktop） | 全绿 | ✅ `37 passed` / 5 文件 |
+| `pnpm typecheck` | 无输出 | ✅ 干净 |
+| `scripts/smoke_api.py` | `SMOKE PASSED` | ✅ 另一会话 T-36 验证栏记录 PASSED |
+| `scripts/smoke_ai.py --from-store` | `AI SMOKE PASSED` | ✅ 另一会话 T-36 验证栏记录 PASSED（真实模型） |
 
-> 数字只在这一处与 `../INDEX.md` 维护，别在别的文档里另写一份基线。
+> **权威数字在 `../09_Reports/ScanReports/Progress.md` §3**，本表是快照——数字随任务推进持续变化，别把这里的数字当定值。
 > `T-24` 的剩余部分不是数字，而是**没有 E2E 黄金路径与 500 章合成语料**。

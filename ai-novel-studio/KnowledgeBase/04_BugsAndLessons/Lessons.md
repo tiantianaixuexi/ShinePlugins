@@ -33,9 +33,9 @@ status: 现行（2026-11-16 建档）
 - **来源**：`.memsearch/memory/2026-11-16.md:61-67`
 - 两次出现"worker 说 87 collected"这类措辞与实数差异。**以自己跑出的点数为准**；配套纪律：任务 done 后必跑 `row` + 自己复跑 pytest。
 
-### L-06 · 非 git 仓库 + 并行改动，改文件前必须先 read
-- **来源**：`.memsearch/memory/2026-11-16.md:53-59`
-- README、INDEX.md 曾在写入前后被更新，无法用 diff 核对是否覆盖他人编辑。本仓库无 git，改文件前先 `read_file` 取当前内容。
+### L-06 · 并行会话改同一文件，改前先 read + git status
+- **来源**：`.memsearch/memory/2026-11-16.md:53-59`；2026-11-16 18:18 订正
+- README、INDEX.md 曾在写入前后被更新。原记忆写"本仓库无 git"是**错的**——仓库根在 `e:\ShinePlugins`（`main...origin/main`，5 个提交）。正确做法：改文件前 `read_file` 取当前内容，并用 `git status`/`git diff` 核对他人未提交改动，避免覆盖。
 
 ### L-07 · 行号与路径双重漂移，按症状重新定位
 - **来源**：`TaskPitfalls.md:11,45` + 2026-11-16 实测

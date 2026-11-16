@@ -61,6 +61,23 @@ _SUMMARIZER = (
     "输出必须是严格的 JSON 对象本身，不要 Markdown 代码块，不要任何解释文字。"
 )
 
+#: Bumped whenever a built-in template changes materially. ``PromptService``
+#: stores the version it last seeded in ``app_meta`` and, on an upgrade, appends
+#: a **new** ``prompt_templates`` version for rows that are still pristine —
+#: never silently keeps rendering the old text, and never overwrites an
+#: author-edited row (see ``LEGACY_USER_TEXTS`` below).
+BUILTIN_VERSION = 2
+
+#: The section v2 added to the three templates that steer a chapter. It is its
+#: own constant because the seeder rebuilds the **v1** text of those templates by
+#: removing it: a stored row equal to that reconstruction is pristine, so a new
+#: version may be appended; anything else is an author edit and stays as is.
+#: Future versions can extend this into a per-version mapping.
+FORESHADOW_SECTION = (
+    "【伏笔与后续规划（尚未发生，只作方向约束，严禁写成已发生）】\n"
+    "{{foreshadows}}\n\n"
+)
+
 #: Prompt used by the L1 memory layer (``chapter_summaries``). It is deliberately
 #: **not** part of :data:`OPERATIONS`: summarising is bookkeeping, not something
 #: the author triggers from the writing toolbar, and it must never run on the
@@ -85,7 +102,8 @@ PROMPTS: tuple[PromptSpec, ...] = (
             "小说类型：{{novel_type}}\n"
             "故事简介：{{synopsis}}\n\n"
             "【前文概要】\n{{context}}\n\n"
-            "请为下一章设计章节大纲，严格按以下结构输出：\n"
+            + FORESHADOW_SECTION
+            + "请为下一章设计章节大纲，严格按以下结构输出：\n"
             "- 章节标题\n"
             "- 章节目标\n"
             "- 核心冲突\n"
@@ -97,7 +115,7 @@ PROMPTS: tuple[PromptSpec, ...] = (
             "- 预计字数\n\n"
             "写作要求：{{instruction}}"
         ),
-        variables=("novel_type", "synopsis", "context", "instruction"),
+        variables=("novel_type", "synopsis", "context", "foreshadows", "instruction"),
     ),
     PromptSpec(
         key=OUTLINE_PROMPT_KEY,
@@ -132,11 +150,12 @@ PROMPTS: tuple[PromptSpec, ...] = (
         user=(
             "【本章大纲】\n{{outline}}\n\n"
             "【必须衔接的前文】\n{{context}}\n\n"
-            "【本章要求】\n{{instruction}}\n\n"
+            + FORESHADOW_SECTION
+            + "【本章要求】\n{{instruction}}\n\n"
             "【目标字数】约 {{target_words}} 字\n\n"
             "请直接输出本章正文。"
         ),
-        variables=("outline", "context", "instruction", "target_words"),
+        variables=("outline", "context", "foreshadows", "instruction", "target_words"),
     ),
     PromptSpec(
         key="write.continue",
@@ -146,10 +165,11 @@ PROMPTS: tuple[PromptSpec, ...] = (
         system=_WRITER,
         user=(
             "【已有正文（结尾处续写）】\n{{context}}\n\n"
-            "【续写要求】\n{{instruction}}\n\n"
+            + FORESHADOW_SECTION
+            + "【续写要求】\n{{instruction}}\n\n"
             "请从已有正文的结尾自然接续，不要重复已有内容，不要输出标题或解释。"
         ),
-        variables=("context", "instruction"),
+        variables=("context", "foreshadows", "instruction"),
     ),
     PromptSpec(
         key="edit.expand",
@@ -237,6 +257,17 @@ PROMPTS: tuple[PromptSpec, ...] = (
 )
 
 PROMPTS_BY_KEY: dict[str, PromptSpec] = {spec.key: spec for spec in PROMPTS}
+
+#: User text shipped by the **previous** built-in version for every template the
+#: current version changed, reconstructed by dropping :data:`FORESHADOW_SECTION`.
+#: ``PromptService.ensure_builtins`` compares a stored row against these to tell
+#: a pristine row (safe to append a new version for) from an author edit (which
+#: must never be overwritten).
+LEGACY_USER_TEXTS: dict[str, tuple[str, ...]] = {
+    spec.key: (spec.user.replace(FORESHADOW_SECTION, ""),)
+    for spec in PROMPTS
+    if FORESHADOW_SECTION in spec.user
+}
 
 #: Operations the AI API exposes, mapped to the prompt key they use.
 OPERATIONS: dict[str, str] = {

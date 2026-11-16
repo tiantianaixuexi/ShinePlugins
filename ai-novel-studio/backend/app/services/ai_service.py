@@ -13,6 +13,7 @@ shows them for review — the author decides whether to accept them.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -25,7 +26,13 @@ from app.ai.llm.registry import ChatClient
 from app.ai.llm.types import ChatMessage, LLMRequest, LLMUsage
 from app.ai.prompts.builtin import OPERATIONS, OUTLINE_PROMPT_KEY, SUMMARY_PROMPT_KEY
 from app.ai.prompts.service import PromptService, render
-from app.ai.structured import REPAIR_INSTRUCTION, as_str_list, complete_json, parse_json_object
+from app.ai.structured import (
+    REPAIR_INSTRUCTION,
+    as_str_list,
+    complete_json,
+    longest_text,
+    parse_json_object,
+)
 from app.core.errors import NotFound, ProviderError, ValidationFailed
 from app.core.ids import new_id
 from app.core.logging import get_logger
@@ -43,6 +50,8 @@ logger = get_logger(__name__)
 #: Operations that reason over the whole chapter rather than a selection.
 WHOLE_CHAPTER_OPERATIONS = frozenset({"write", "continue", "review", "outline"})
 SELECTION_OPERATIONS = frozenset({"expand", "rewrite", "polish"})
+#: Operations whose prompt asks for the forward-looking 「伏笔与后续规划」 block.
+FORESHADOW_OPERATIONS = frozenset({"write", "outline", "continue"})
 
 DEFAULT_TARGET_WORDS = 2000
 MAX_CONTEXT_CHARS = 24_000
@@ -86,8 +95,35 @@ def _truncate(text: str, limit: int, *, from_end: bool = False) -> str:
     return f"{text[:limit]}\n…（后文已省略）"
 
 
+def _one_line(text: str) -> str:
+    """Collapse whitespace so a field can live on a single bullet line."""
+    return " ".join(text.split())
+
+
+def _dedupe(items: list[Any], limit: int = 8) -> list[str]:
+    """Order-preserving de-duplication of short labels (empty ones dropped)."""
+    seen: dict[str, None] = {}
+    for item in items:
+        label = _one_line(str(item))
+        if label and label not in seen:
+            seen[label] = None
+        if len(seen) >= limit:
+            break
+    return list(seen)
+
+
 #: Short-word columns of a :class:`ChapterSummary` row.
 SUMMARY_LIST_FIELDS = ("characters", "events", "locations", "keywords", "foreshadows")
+
+
+def content_fingerprint(content: str) -> str:
+    """Fingerprint of a chapter body, stored as ``chapter_summaries.source_hash``.
+
+    Trimmed first so a stray trailing newline from an editor does not buy a paid
+    regeneration. 32 hex chars (128 bits) is far beyond collision risk for one
+    project and keeps the column short.
+    """
+    return hashlib.sha256((content or "").strip().encode("utf-8")).hexdigest()[:32]
 
 
 def _summary_payload(text: str, data: dict[str, Any] | None) -> dict[str, Any]:
@@ -125,7 +161,9 @@ def _outline_payload(
 
     A model that ignores the JSON instruction must not cost the author the
     outline: the reply is then kept verbatim in ``content`` and the row is
-    flagged as ``degraded`` instead of raising.
+    flagged as ``degraded`` instead of raising. ``text`` is the reply
+    :func:`~app.ai.structured.complete_json` picked as the longest of all
+    attempts, so a truncated first answer survives an empty repair turn.
     """
     raw = (text or "").strip()
     parsed: dict[str, Any] = {
@@ -381,6 +419,10 @@ class AIService:
         yield AIStreamEvent(type="reset")
         data, text, usage = await self._repair_json(model, request, out.text, out.usage)
         out.usage = usage
+        if data is None:
+            # Degraded: the row will store this text verbatim, so keep whichever
+            # reply says more instead of a blank (or shorter) repair turn.
+            text = longest_text(out.text, text)
         if text:
             out.text = text
             yield AIStreamEvent(type="delta", text=text)
@@ -438,9 +480,11 @@ class AIService:
     ) -> dict[str, Any]:
         """Distil one chapter into a ``chapter_summaries`` row (L1 memory).
 
-        This is the **only** writer of that table, and it is deliberately never
-        called from the autosave path: every call is a paid model request, so it
-        runs when the author (or the memory agent) explicitly asks for it.
+        This is the **only** writer of that table. Every miss is a paid model
+        request, so the cache is deliberately content-aware: a row is reused only
+        when it was made from the *same* chapter text (``source_hash``). That is
+        what makes it safe for the UI to fire this off when the author leaves a
+        chapter — an untouched chapter costs nothing, an edited one costs one call.
         """
         chapter = self.novels.get_chapter(project_id, chapter_id)
         content = (chapter.content or "").strip()
@@ -452,8 +496,14 @@ class AIService:
                 "skipped": "empty",
             }
 
+        fingerprint = content_fingerprint(content)
         existing = self._summary_row(project_id, chapter_id)
-        if existing is not None and existing.summary and not force:
+        if (
+            existing is not None
+            and existing.summary
+            and existing.source_hash == fingerprint
+            and not force
+        ):
             return {"chapter_id": chapter_id, "summary": existing.summary, "cached": True}
 
         model = self._resolve_model("summary", model_config_id)
@@ -489,7 +539,7 @@ class AIService:
             usage=reply.usage,
         )
         parsed = _summary_payload(reply.text, reply.data)
-        self._write_summary(project_id, chapter_id, parsed, model.id)
+        self._write_summary(project_id, chapter_id, parsed, model.id, fingerprint)
         logger.info(
             "chapter_summary_saved",
             project_id=project_id,
@@ -527,8 +577,14 @@ class AIService:
             )
             return
 
+        fingerprint = content_fingerprint(content)
         existing = self._summary_row(project_id, chapter_id)
-        if existing is not None and existing.summary and not force:
+        if (
+            existing is not None
+            and existing.summary
+            and existing.source_hash == fingerprint
+            and not force
+        ):
             yield AIStreamEvent(
                 type="done",
                 data={
@@ -568,7 +624,7 @@ class AIService:
                 usage=reply.usage,
             )
             settled = True
-            self._write_summary(project_id, chapter_id, parsed, model.id)
+            self._write_summary(project_id, chapter_id, parsed, model.id, fingerprint)
             logger.info(
                 "chapter_summary_saved",
                 project_id=project_id,
@@ -647,8 +703,13 @@ class AIService:
         chapter_id: str,
         parsed: dict[str, Any],
         model_config_id: str | None,
+        source_hash: str,
     ) -> None:
-        """Upsert by ``chapter_id`` (the column is unique)."""
+        """Upsert by ``chapter_id`` (the column is unique).
+
+        *source_hash* is the fingerprint of the text that was just summarised, so
+        a later call can tell "same body, reuse it" from "the author edited it".
+        """
         prompt_version = self._prompt_version(SUMMARY_PROMPT_KEY)
         database = self.novels.database_for(project_id)
         with database.session() as session:
@@ -668,6 +729,7 @@ class AIService:
             row.plot_progress = parsed["plot_progress"]
             row.model_config_id = model_config_id
             row.prompt_version = prompt_version
+            row.source_hash = source_hash
 
     # ------------------------------------------------------------------
     # L1 outlines: structured, persisted chapter outlines
@@ -946,6 +1008,8 @@ class AIService:
         sections: list[str] = []
 
         if operation in ("write", "outline"):
+            # Only chapters *before* the target one: the target's own summary and
+            # anything after it would leak plot the author has not written yet.
             summaries = self._recent_summaries(payload.project_id, payload.chapter_id)
             if summaries:
                 sections.append("【前情提要】\n" + "\n".join(summaries))
@@ -972,10 +1036,17 @@ class AIService:
             characters = self._characters_digest(payload.project_id)
             events = self._events_digest(payload.project_id)
 
+        # Forward-looking channel. Kept strictly separate from ``context``: what
+        # has not happened yet must never be phrased as if it had.
+        foreshadows = "（无）"
+        if operation in FORESHADOW_OPERATIONS:
+            foreshadows = self._foreshadow_digest(payload.project_id, payload.chapter_id) or "（无）"
+
         return {
             "novel_type": project.novel_type or "",
             "synopsis": project.synopsis or "",
             "context": context,
+            "foreshadows": foreshadows,
             "outline": outline,
             "selection": selection,
             "instruction": payload.instruction or "（无特殊要求）",
@@ -987,24 +1058,149 @@ class AIService:
     def _recent_summaries(
         self, project_id: str, chapter_id: str | None, limit: int = 5
     ) -> list[str]:
+        """Summaries of the *prior* chapters, newest last.
+
+        "Prior" is ``Chapter.sort_order`` strictly below the target chapter's, so
+        neither the target's own summary nor a later chapter's leaks into
+        「前情提要」. Without a resolvable target the last *limit* chapters are
+        used, which is what an unscoped request wants.
+        """
         database = self.novels.database_for(project_id)
         with database.session() as session:
+            statement = (
+                select(ChapterSummary)
+                .join(Chapter, Chapter.id == ChapterSummary.chapter_id)
+                .where(
+                    ChapterSummary.project_id == project_id,
+                    Chapter.is_deleted.is_(False),
+                )
+            )
+            target = self._target_chapter(session, project_id, chapter_id)
+            if target is not None:
+                statement = statement.where(Chapter.sort_order < target.sort_order)
             rows = list(
                 session.scalars(
-                    select(ChapterSummary)
-                    .join(Chapter, Chapter.id == ChapterSummary.chapter_id)
-                    .where(
-                        ChapterSummary.project_id == project_id,
-                        Chapter.is_deleted.is_(False),
-                    )
-                    .order_by(Chapter.sort_order.desc())
-                    .limit(limit)
+                    statement.order_by(Chapter.sort_order.desc()).limit(limit)
                 )
             )
         summaries = [row.summary for row in reversed(rows) if row.summary]
         if not summaries:
             return []
         return [f"- {summary}" for summary in summaries]
+
+    @staticmethod
+    def _target_chapter(session: Any, project_id: str, chapter_id: str | None) -> Chapter | None:
+        """The chapter being written, or ``None`` when it cannot be resolved."""
+        if not chapter_id:
+            return None
+        chapter = session.get(Chapter, chapter_id)
+        if chapter is None or chapter.project_id != project_id or chapter.is_deleted:
+            return None
+        return chapter
+
+    def _foreshadow_digest(self, project_id: str, chapter_id: str | None) -> str:
+        """The 「伏笔与后续规划」 block: planned-forward plus already planted."""
+        plan = self._story_plan(project_id, chapter_id)
+        planted = self._unresolved_foreshadows(project_id)
+        parts = [part for part in (plan, planted) if part]
+        return "\n\n".join(parts)
+
+    def _story_plan(
+        self, project_id: str, chapter_id: str | None, lookahead: int = 3
+    ) -> str:
+        """What the target chapter and up to *lookahead* chapters plan to do.
+
+        Read from the chapter-level ``outlines`` rows first and from
+        ``chapter_summaries`` when a chapter has no outline yet. This is material
+        for the *direction* of the writing only — the prompt labels it as "not
+        yet happened", so it can never be narrated as fact.
+        """
+        if not chapter_id:
+            return ""
+        database = self.novels.database_for(project_id)
+        with database.session() as session:
+            chapters = list(
+                session.scalars(
+                    select(Chapter)
+                    .where(
+                        Chapter.project_id == project_id,
+                        Chapter.is_deleted.is_(False),
+                    )
+                    .order_by(Chapter.sort_order, Chapter.created_at)
+                )
+            )
+            index = next((i for i, row in enumerate(chapters) if row.id == chapter_id), None)
+            if index is None:
+                return ""
+            window = chapters[index : index + max(lookahead, 0) + 1]
+            ids = [row.id for row in window]
+            outlines = {
+                row.parent_id: row
+                for row in session.scalars(
+                    select(Outline).where(
+                        Outline.project_id == project_id,
+                        Outline.level == "chapter",
+                        Outline.parent_id.in_(ids),
+                    )
+                )
+            }
+            summaries = {
+                row.chapter_id: row
+                for row in session.scalars(
+                    select(ChapterSummary).where(
+                        ChapterSummary.project_id == project_id,
+                        ChapterSummary.chapter_id.in_(ids),
+                    )
+                )
+            }
+
+        lines: list[str] = []
+        for offset, chapter in enumerate(window):
+            outline = outlines.get(chapter.id)
+            summary = summaries.get(chapter.id)
+            goal = ((outline.goal if outline else "") or (summary.plot_progress if summary else ""))
+            clues = _dedupe(
+                [
+                    *((outline.foreshadows if outline else None) or []),
+                    *((summary.foreshadows if summary else None) or []),
+                ]
+            )
+            if not goal.strip() and not clues:
+                continue
+            number = index + offset + 1
+            title = ((outline.title if outline else "") or chapter.title or "").strip()
+            details = [f"目标={_one_line(goal)}"] if goal.strip() else []
+            if clues:
+                details.append("伏笔=" + "、".join(clues))
+            lines.append(f"- 第 {number} 章「{title[:40]}」：" + "；".join(details) + "；")
+        return "\n".join(lines)
+
+    def _unresolved_foreshadows(self, project_id: str, limit: int = 12) -> str:
+        """Foreshadows planted in existing chapter outlines, flagged as open.
+
+        Reminder-only: there is no "resolved" flag in the schema yet, so every
+        planted item is listed as 「已埋」 for the author to close out.
+        """
+        database = self.novels.database_for(project_id)
+        with database.session() as session:
+            rows = list(
+                session.scalars(
+                    select(Outline)
+                    .where(Outline.project_id == project_id, Outline.level == "chapter")
+                    .order_by(Outline.sort_order)
+                )
+            )
+        lines: list[str] = []
+        for row in rows:
+            for clue in _dedupe(list(row.foreshadows or [])):
+                lines.append(f"- {clue}（已埋，见大纲「{(row.title or '')[:40]}」，待回收）")
+                if len(lines) >= limit:
+                    break
+            if len(lines) >= limit:
+                break
+        if not lines:
+            return ""
+        return "【此前已埋伏笔】\n" + "\n".join(lines)
 
     def _characters_digest(self, project_id: str, limit: int = 12) -> str:
         from app.models.novel import Character

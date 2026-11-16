@@ -13,8 +13,10 @@ status: 现行（2026-11-16 建档）
 
 | 状态 | 数量 | 编号 |
 |---|---|---|
-| 待修 | 3 | DEF-01、DEF-02、DEF-03 |
-| 已关闭（历史归档） | 10 | DEF-04 ~ DEF-13 |
+| 待修 | 2 | DEF-01、DEF-02 |
+| 已关闭（历史归档） | 11 | DEF-03、DEF-04 ~ DEF-13 |
+
+> 2026-11-16 18:16 同步：DEF-03 已随 `T-35` 关闭（`complete_json` 降级回退最长原文，pytest 111+），从待修移入归档。
 
 - 可信度：✅ 有代码/测试证据；△ 有依据未验证。
 - 分类：`静态`（代码可验证）/ `已发生`（有历史事件为证）。
@@ -41,21 +43,13 @@ status: 现行（2026-11-16 建档）
 - **关联**：`T-12`；来源 `TaskPitfalls.md:46`。
 - **状态**：待修
 
-### DEF-03 · 非流式大纲修复轮空回复时丢原文 `已发生` ✅
-
-- **现象**：`complete_json` 修复轮返回空文本时直接返回 `StructuredReply(text=response.text)`，首轮原文未回退，degraded 结果 content 为空。真实模型冒烟曾触发："首轮截断 + 修复轮空回复 → degraded=True 且 content 为空"，导致 `AI SMOKE FAILED: 1`。
-- **证据**：`backend/app/ai/structured.py:136-149`（首轮文本只在 `attempts>retries` 分支经 `response.text` 返回，未保留 attempt 1）；失败输出记于 `../05_Plan/TaskRegister.md` T-30 验证栏；断言点 `scripts/smoke_ai.py:280-287`。
-- **影响**：降级路径产出空正文，用户看到"生成成功但没内容"。
-- **修法**：保存首轮 `response.text`，修复轮解析失败或空文本时回退首轮原文。
-- **验收**：mock「首轮截断 JSON + 修复轮空回复」→ `smoke_ai.py` 第 4 步 PASS 且 `content` 非空。
-- **状态**：待修
-
 ## §2 已关闭（历史归档）
 
 > 来源：`../05_Plan/TaskRegister.md` 已关闭区（均 2026-11-16）。这些是"确实修了 bug"的任务映射为 DEF 编号，作为历史留档；修法与验证输出详见 TaskRegister 对应行（本表只留指针，不重复描述）。
 
 | DEF | 原 T-xx | 现象（摘要） | 修法指针 | 验证 |
 |---|---|---|---|---|
+| DEF-03 | T-35 | 非流式大纲修复轮空回复丢原文，degraded 结果 content 为空 | complete_json 降级回退最长原文（新增 longest_text）；流式/非流式均据此写 content | pytest 111（新增 3 条）；smoke_ai PASSED（降级路径靠单测覆盖） |
 | DEF-04 | T-01 | 前情提要恒为空（chapter_summaries 只读无写） | 新增 memory.summary + summarize_chapter upsert + POST /ai/summary/{id} | pytest 64→…；smoke_api PASSED |
 | DEF-05 | T-02 | AI 采纳记成 source=user，task_id 血缘丢失 | POST /chapters/{id}/accept-ai；迁移 v2 | pytest 69；typecheck 干净；test 32 |
 | DEF-06 | T-03 | 结构化输出缺失，json_mode 硬编码 false | 新增 ai/structured.py 宽松解析+一次修复 | pytest 75；ruff clean |
@@ -65,9 +59,11 @@ status: 现行（2026-11-16 建档）
 | DEF-10 | T-07 | agent_configs 零读写，无法按 Agent 选模型 | AgentConfigService + _resolve_model 优先级 | pytest 101；smoke_api PASSED |
 | DEF-11 | T-08 | AI 面板无丢弃，结果不持久化 | 加「丢弃」abort+清空 | typecheck 干净；test 32；build ✓ |
 | DEF-12 | T-26 | 降级链不校验备模型 is_active | _chain 对 fallback 也校验 is_active | pytest 96；fallback 9 passed |
-| DEF-13 | T-30（部分） | 非流式大纲 103.7s 无反馈 | 新增两个 /stream 端点（流式部分已交付，见 §1 DEF-03 为其遗留缺陷） | pytest 105；流式大纲 41 增量/50.1s PASS |
+| DEF-13 | T-30（部分） | 非流式大纲 103.7s 无反馈 | 新增两个 /stream 端点 | pytest 105；流式大纲 41 增量/50.1s PASS |
 
-> DEF-13 说明：T-30 的"加进度反馈"已通过流式端点实现并关闭，但真实模型冒烟暴露的降级空内容（DEF-03）仍在修。两者是同一任务的正反两面，分列编号。
+> DEF-13 说明：T-30 的"加进度反馈"已通过流式端点实现并关闭；其暴露的降级空内容另立 DEF-03，也已随 T-35 关闭。两者是同一任务的正反两面，分列编号。
+>
+> 另：T-36（推理型模型首字长时间无输出，解析 `reasoning_content` 为 thinking 事件）已关闭，属体验改进非"代码写错"，不单列 DEF，见 TaskRegister T-36。
 
 ## §3 明确不收（避免误录）
 

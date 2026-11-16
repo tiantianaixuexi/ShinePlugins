@@ -322,6 +322,16 @@ export interface StreamUsage {
   output_tokens: number;
 }
 
+/** Result of `POST /ai/summary/{chapter_id}` (the non-streaming call). */
+export interface SummaryResult {
+  chapter_id: string;
+  summary: string;
+  /** True when an up-to-date summary was returned without calling the model. */
+  cached?: boolean;
+  /** `"empty"` when the chapter body is blank and nothing was generated. */
+  skipped?: string | null;
+}
+
 /** `done` payload of the streamed summary call. */
 export interface SummaryStreamResult {
   chapter_id: string;

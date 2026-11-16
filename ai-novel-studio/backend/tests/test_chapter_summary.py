@@ -161,10 +161,18 @@ def test_first_call_writes_row_and_recent_summaries(
     assert row.model_config_id == model_id
     assert row.prompt_version is not None
 
-    # The whole point of the row: 「前情提要」 must stop being empty.
-    summaries = client.app.state.runtime.ai._recent_summaries(  # type: ignore[attr-defined]
-        project_id, chapter_id
+    # The whole point of the row: 「前情提要」 must stop being empty — but only for
+    # *later* chapters. The chapter's own summary would be a self-spoiler (T-33).
+    ai = client.app.state.runtime.ai  # type: ignore[attr-defined]
+    assert ai._recent_summaries(project_id, chapter_id) == []
+
+    later = client.post(
+        f"/api/projects/{project_id}/chapters",
+        json={"title": "第二章 铃声"},
+        headers=auth,
     )
+    assert later.status_code == 201, later.text
+    summaries = ai._recent_summaries(project_id, later.json()["id"])
     assert summaries and SUMMARY_PAYLOAD["summary"] in summaries[0]
 
 

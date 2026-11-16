@@ -3,22 +3,39 @@
 Built-ins are seeded into ``prompt_templates`` once; from then on the table is
 authoritative, so editing a prompt in the UI takes effect immediately and the
 change is recorded per generation.
+
+A later build that changes a built-in text bumps
+:data:`~app.ai.prompts.builtin.BUILTIN_VERSION`; :meth:`PromptService.ensure_builtins`
+then appends a new version for rows that are still pristine (content equal to the
+previous built-in), so an upgrade is never silently ignored, while a row the
+author edited is left untouched.
 """
 
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from sqlalchemy import select
 
-from app.ai.prompts.builtin import OPERATIONS, PROMPTS, PROMPTS_BY_KEY, PromptSpec
+from app.ai.prompts.builtin import (
+    BUILTIN_VERSION,
+    LEGACY_USER_TEXTS,
+    OPERATIONS,
+    PROMPTS,
+    PROMPTS_BY_KEY,
+    PromptSpec,
+)
 from app.core.logging import get_logger
 from app.db.session import Database
-from app.models.studio import PromptTemplate
+from app.models.studio import AppMeta, PromptTemplate
 
 logger = get_logger(__name__)
 
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
+
+#: ``app_meta`` key holding the ``BUILTIN_VERSION`` last seeded.
+BUILTIN_VERSION_KEY = "prompts.builtin_version"
 
 
 def render(template: str, variables: dict[str, str]) -> tuple[str, list[str]]:
@@ -47,33 +64,110 @@ class PromptService:
 
     # -- seeding ----------------------------------------------------------
     def ensure_builtins(self) -> int:
-        """Insert any built-in prompt that is missing. Returns the count added."""
+        """Seed missing built-ins and upgrade pristine rows. Returns count added.
+
+        Runs on every start. Three cases per template:
+
+        * no row yet → insert version 1 with the current text;
+        * a row exists and ``app_meta`` says an older built-in version was
+          seeded, and every stored row still matches a shipped text
+          (pristine) → append a new version with the current text;
+        * a row exists and the author edited it → leave it alone; the database
+          wins, exactly as documented for :meth:`resolve`.
+        """
         with self.db.session() as session:
-            existing = set(session.scalars(select(PromptTemplate.key)))
+            stored_version = self._stored_builtin_version(session)
+            latest_by_key = self._latest_rows(session)
             added = 0
             for spec in PROMPTS:
-                if spec.key in existing:
+                latest = latest_by_key.get(spec.key)
+                content = self._compose(spec)
+                if latest is None:
+                    self._add_row(session, spec, version=1, content=content)
+                    added += 1
                     continue
-                session.add(
-                    PromptTemplate(
-                        key=spec.key,
-                        name=spec.name,
-                        version=1,
-                        content=self._compose(spec),
-                        variables=list(spec.variables),
-                        description=spec.description,
-                        is_active=True,
-                    )
-                )
+                if stored_version >= BUILTIN_VERSION:
+                    continue
+                if latest.content == content:
+                    continue
+                if not self._is_pristine(spec, latest.content):
+                    logger.info("prompts_builtin_upgrade_skipped", key=spec.key)
+                    continue
+                self._add_row(session, spec, version=latest.version + 1, content=content)
                 added += 1
+                logger.info(
+                    "prompts_builtin_upgraded",
+                    key=spec.key,
+                    version=latest.version + 1,
+                )
+            self._store_builtin_version(session, BUILTIN_VERSION)
             if added:
                 logger.info("prompts_seeded", count=added)
         return added
 
     @staticmethod
-    def _compose(spec: PromptSpec) -> str:
+    def _latest_rows(session: Any) -> dict[str, PromptTemplate]:
+        """Highest-version row per key (the one :meth:`resolve` would pick)."""
+        rows = session.scalars(
+            select(PromptTemplate).order_by(PromptTemplate.key, PromptTemplate.version.desc())
+        )
+        latest: dict[str, PromptTemplate] = {}
+        for row in rows:
+            latest.setdefault(row.key, row)
+        return latest
+
+    @classmethod
+    def _add_row(
+        cls, session: Any, spec: PromptSpec, *, version: int, content: str
+    ) -> PromptTemplate:
+        row = PromptTemplate(
+            key=spec.key,
+            name=spec.name,
+            version=version,
+            content=content,
+            variables=list(spec.variables),
+            description=spec.description,
+            is_active=True,
+        )
+        session.add(row)
+        return row
+
+    @classmethod
+    def _is_pristine(cls, spec: PromptSpec, content: str) -> bool:
+        """True when *content* is an unedited built-in this build shipped before."""
+        return any(
+            content == cls._compose_text(spec.system, legacy_user)
+            for legacy_user in LEGACY_USER_TEXTS.get(spec.key, ())
+        )
+
+    @staticmethod
+    def _stored_builtin_version(session: Any) -> int:
+        """``BUILTIN_VERSION`` seen at the last seed; 1 for pre-marker databases."""
+        row = session.get(AppMeta, BUILTIN_VERSION_KEY)
+        if row is None:
+            return 1
+        try:
+            return int(row.value)
+        except (TypeError, ValueError):
+            logger.warning("prompts_builtin_version_unreadable", value=row.value)
+            return 1
+
+    @staticmethod
+    def _store_builtin_version(session: Any, version: int) -> None:
+        row = session.get(AppMeta, BUILTIN_VERSION_KEY)
+        if row is None:
+            session.add(AppMeta(key=BUILTIN_VERSION_KEY, value=str(version)))
+        else:
+            row.value = str(version)
+
+    @classmethod
+    def _compose(cls, spec: PromptSpec) -> str:
         """Store system + user in one column, separated by a marker line."""
-        return f"### system\n{spec.system}\n### user\n{spec.user}"
+        return cls._compose_text(spec.system, spec.user)
+
+    @staticmethod
+    def _compose_text(system: str, user: str) -> str:
+        return f"### system\n{system}\n### user\n{user}"
 
     @staticmethod
     def _split(content: str, fallback: PromptSpec) -> tuple[str, str]:

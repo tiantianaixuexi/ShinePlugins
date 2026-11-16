@@ -66,6 +66,7 @@ class Drained:
 
     deltas: int = 0
     thoughts: int = 0
+    resets: int = 0
     done: dict | None = None
     error: dict | None = None
     text: str = ""
@@ -90,6 +91,11 @@ async def drain(events, started: float) -> Drained:
             if out.first_delta_at is None:
                 out.first_delta_at = time.perf_counter() - started
             parts.append(event.text)
+        elif event.type == "reset":
+            # Control frame, not an error: the JSON repair re-sends the whole
+            # answer, so whatever the first attempt streamed is thrown away.
+            out.resets += 1
+            parts.clear()
         elif event.type == "done":
             out.done = event.data
         else:
@@ -110,6 +116,8 @@ def frame_lines(drained: Drained) -> None:
     print(f"  首个 thinking 帧 {_seconds(drained.first_thinking_at)} · 首个 delta 帧 {_seconds(drained.first_delta_at)}")
     if drained.thoughts:
         print(f"  思考帧 {drained.thoughts} 个 / {len(drained.thinking)} 字（不计入正文）")
+    if drained.resets:
+        print(f"  收到 {drained.resets} 个 reset 帧（JSON 修复重试，已丢弃前一轮增量）")
 
 
 def spend_line(runtime: Runtime, project_id: str, kind: str, elapsed: float) -> None:
@@ -341,7 +349,9 @@ async def main_async(args: argparse.Namespace) -> int:
         elapsed = time.perf_counter() - started
         done = streamed.done
         check("流式大纲没有报错", streamed.error is None, str(streamed.error))
-        check("流式大纲收到增量", streamed.deltas > 1, f"{streamed.deltas} 个增量")
+        # ``> 0``, not ``> 1``: after a ``reset`` the repaired answer often arrives
+        # as a single chunk, which is still a streamed reply.
+        check("流式大纲收到增量", streamed.deltas > 0, f"{streamed.deltas} 个增量")
         check("流式大纲已落库", bool(done and done.get("outline_id")), str(done)[:160])
         if streamed.first_delta_at is not None:
             print(f"  首字延迟 {streamed.first_delta_at:.2f}s · 总耗时 {elapsed:.1f}s · {streamed.deltas} 个增量")

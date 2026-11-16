@@ -28,18 +28,18 @@ Python 3.13+、Node.js 20+、pnpm、Rust 1.93+（`README.md:40`）。
 | 桌面开发 | `pnpm tauri dev`（`desktop/`） | Rust 自动注入动态端口/令牌并管理后端；首次编译数分钟 | `tauri.conf.json:7-8`、`README.md:54-58,220-223` |
 | 打包 | `pnpm tauri build`（`desktop/`） | msi/nsis → `src-tauri/target/release/bundle/` | `tauri.conf.json:9-10,30-32`、`README.md:272` |
 
-## 验证（数字以 2026-11-16 实测为准）
+## 验证（2026-11-16 18:16 快照；权威数字见 `../09_Reports/ScanReports/Progress.md` §3）
 
 | 命令（cwd） | 实测结果 | 证据 |
 |---|---|---|
-| `.venv\Scripts\python.exe -m pytest -q`（`backend/`） | **104 passed**（104 个点全绿；无汇总行输出） | 本次实测 2026-11-16 |
-| `pnpm test`（`desktop/`） | **36 passed (5 文件)**：utils 14 · ai 9 · text-edit 6 · api 4 · sidecar 3 | 本次实测 2026-11-16 |
+| `.venv\Scripts\python.exe -m pytest -o addopts='' -q --tb=no`（`backend/`） | **117 passed in 55.45s** | 本次实测（叠加 -q 会静默到无汇总行，须覆盖 addopts） |
+| `pnpm test`（`desktop/`） | **37 passed (5 文件)**：utils 14 · ai 10 · text-edit 6 · api 4 · sidecar 3 | 本次实测 |
 | `pnpm typecheck`（`desktop/`） | 无输出（`tsc --noEmit` 干净） | 本次实测 |
-| `scripts\smoke_api.py`（仓库根，用 backend venv） | `SMOKE PASSED: all checks green` | `README.md:308-318`；本次未跑 |
-| `scripts\smoke_ai.py --from-store`（仓库根） | 需已配置模型，本次未跑 | `README.md:389` |
-| `cargo check`（`desktop/src-tauri/`） | `Finished`；本次未跑 | `README.md:374-379` |
+| `scripts\smoke_api.py`（仓库根，用 backend venv） | `SMOKE PASSED: all checks green` | 另一会话 T-36 验证栏记录 PASSED |
+| `scripts\smoke_ai.py --from-store`（仓库根） | `AI SMOKE PASSED`（需已配置模型） | 另一会话 T-36 验证栏记录 PASSED（真实模型） |
+| `cargo check`（`desktop/src-tauri/`） | `Finished`，无 error | `README.md:374-379`；本轮未跑 |
 
-> **数字漂移警告**：旧文档多处写 pytest 60 / vitest 29、CurrentStatus 写 96/32、AGENTS.md 写 29——均与本次实测（104/36）不符。判别以本页实测为准，其它页的旧数字属待同步项（见 `../09_Reports/ScanReports/Progress.md`）。`README.md:349` 写 29 passed、`README.md:384` 写 25 passed，自身也矛盾（`取证:README.md`）。
+> **数字持续变化**（测例随任务推进增加）：本表是快照，判别以 `Progress.md` §3 为准。旧文档（README 349 写 29 / 384 写 25、AGENTS 写 29）已是过期值。
 
 ## Windows 特有约束
 

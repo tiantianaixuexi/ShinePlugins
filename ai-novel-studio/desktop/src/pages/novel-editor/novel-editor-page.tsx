@@ -33,6 +33,7 @@ import {
 } from "@/hooks/use-novel";
 import { useProject } from "@/hooks/use-projects";
 import { api, errorMessage } from "@/lib/api";
+import { createSummaryTriggerLog } from "@/lib/summary-autosave";
 import { applyText } from "@/lib/text-edit";
 import type { Chapter } from "@/types/api";
 
@@ -57,6 +58,8 @@ interface ChapterWorkspaceProps {
   projectId: string;
   chapter: Chapter;
   onOpenHistory: () => void;
+  /** Called with the chapter the author just left, and the text they left it in. */
+  onChapterLeft: (chapterId: string, content: string) => void;
 }
 
 /**
@@ -67,12 +70,33 @@ interface ChapterWorkspaceProps {
  * id. Only if that call fails does the text land in the local buffer instead —
  * the author's words must never be dropped on a network hiccup.
  */
-function ChapterWorkspace({ projectId, chapter, onOpenHistory }: ChapterWorkspaceProps) {
+function ChapterWorkspace({
+  projectId,
+  chapter,
+  onOpenHistory,
+  onChapterLeft,
+}: ChapterWorkspaceProps) {
   const draft = useChapterDraft(projectId, chapter);
   const queryClient = useQueryClient();
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [selection, setSelection] = useState("");
   const [aiOpen, setAiOpen] = useState(true);
+
+  // Read through a ref so the unmount cleanup below sees the latest text and the
+  // newest callback without re-registering on every keystroke.
+  const leaveRef = useRef({ chapterId: chapter.id, content: draft.content, draft, onChapterLeft });
+  leaveRef.current = { chapterId: chapter.id, content: draft.content, draft, onChapterLeft };
+
+  // Leaving the chapter (the parent remounts this component under a new key) is
+  // when its L1 summary is refreshed. The pending autosave is flushed first so
+  // the server summarises the text the author actually left behind, not the
+  // version from before the last keystrokes.
+  useEffect(() => {
+    return () => {
+      const left = leaveRef.current;
+      void left.draft.flush().finally(() => left.onChapterLeft(left.chapterId, left.content));
+    };
+  }, []);
 
   const handleApply = useCallback(
     async (text: string, mode: ApplyMode) => {
@@ -154,6 +178,9 @@ function Workspace({ projectId }: { projectId: string }) {
   const deleteChapter = useDeleteChapter(projectId);
 
   const [activeChapterId, setActiveChapterId] = useState<string | null>(null);
+  // One entry per (chapter, body) already sent this session. Lives here because
+  // ChapterWorkspace remounts on every switch; a ref in the parent survives it.
+  const summaryTriggers = useRef(createSummaryTriggerLog());
   const [historyOpen, setHistoryOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   // Bumped after a restore so the editor remounts with the restored text.
@@ -223,6 +250,26 @@ function Workspace({ projectId }: { projectId: string }) {
     setChapterEpoch((value) => value + 1);
   }, [chapterQuery]);
 
+  /**
+   * Refresh the L1 summary of the chapter the author just left.
+   *
+   * Fire-and-forget on purpose: it must never block the switch, and a failure is
+   * not the author's problem — they never asked for it. No toast, console only.
+   * The backend caches by content fingerprint, so the cost is at most one model
+   * call per chapter *that actually changed*.
+   */
+  const handleChapterLeft = useCallback(
+    (chapterId: string, content: string) => {
+      if (!summaryTriggers.current.claim(chapterId, content)) return;
+      void api.ai
+        .summarizeChapter(projectId, chapterId, { force: false })
+        .catch((error: unknown) => {
+          console.warn("章节摘要自动更新失败（正文已保存，不影响写作）", error);
+        });
+    },
+    [projectId],
+  );
+
   const activeChapter = chapterQuery.data;
 
   if (project.isError) {
@@ -288,6 +335,7 @@ function Workspace({ projectId }: { projectId: string }) {
             projectId={projectId}
             chapter={activeChapter}
             onOpenHistory={() => setHistoryOpen(true)}
+            onChapterLeft={handleChapterLeft}
           />
         )}
       </div>

@@ -79,9 +79,35 @@ def _add_chapter_version_task_id(connection: Connection) -> None:
     )
 
 
+def _add_chapter_summary_source_hash(connection: Connection) -> None:
+    """v3: remember which chapter text a summary was made from.
+
+    Purely additive and nullable. Before it, a summary was cached on "a non-empty
+    row exists", so editing a chapter and asking again returned the stale memory.
+    The fingerprint lets the cache stay content-aware: same body → free cache hit,
+    edited body → one paid regeneration.
+
+    Existing rows keep ``source_hash`` NULL, which the service treats as stale —
+    they get refreshed the next time that chapter is summarised, and nothing is
+    rewritten or lost here.
+    """
+    columns = {
+        str(row[1]) for row in connection.execute(text("PRAGMA table_info(chapter_summaries)"))
+    }
+    if "source_hash" not in columns:
+        connection.execute(
+            text("ALTER TABLE chapter_summaries ADD COLUMN source_hash VARCHAR(64)")
+        )
+
+
 MIGRATIONS: list[Migration] = [
     (1, "baseline schema (created from the SQLAlchemy models)", _baseline),
     (2, "chapter_versions.task_id (AI blood-line)", _add_chapter_version_task_id),
+    (
+        3,
+        "chapter_summaries.source_hash (content-aware summary cache)",
+        _add_chapter_summary_source_hash,
+    ),
 ]
 
 

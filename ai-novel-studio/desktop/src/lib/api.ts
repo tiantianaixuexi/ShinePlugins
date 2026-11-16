@@ -24,6 +24,7 @@ import type {
   ProjectSummary,
   ProjectUpdate,
   StudioStats,
+  SummaryResult,
   SystemInfo,
   Volume,
   VolumeCreate,
@@ -250,6 +251,19 @@ export const api = {
         path(projectId, "chapters", chapterId, "versions", versionId, "restore"),
         { method: "POST" },
       ),
+  },
+
+  ai: {
+    /**
+     * `POST /api/ai/summary/{chapter_id}` — distill one chapter into the L1
+     * memory row. The backend caches by content fingerprint, so calling it with
+     * `force: false` on an unchanged chapter costs nothing.
+     */
+    summarizeChapter: (projectId: string, chapterId: string, options?: { force?: boolean }) =>
+      request<SummaryResult>(`/api/ai/summary/${encodeURIComponent(chapterId)}`, {
+        method: "POST",
+        body: { project_id: projectId, force: options?.force ?? false },
+      }),
   },
 
   modelConfigs: {

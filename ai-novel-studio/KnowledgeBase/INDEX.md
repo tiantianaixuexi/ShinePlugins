@@ -85,16 +85,15 @@ Tauri 2 + React 19 桌面端，FastAPI + SQLite sidecar。仓库根 `ai-novel-st
 
 | 命令（cwd） | 期望（2026-11-16 实测） |
 |---|---|
-| `backend\.venv\Scripts\python.exe -m pytest -q`（backend） | `104 passed` |
-| `backend\.venv\Scripts\python.exe scripts\smoke_api.py`（仓库根） | `SMOKE PASSED: all checks green`（27 项；本次未跑） |
-| `backend\.venv\Scripts\python.exe scripts\smoke_ai.py --from-store`（仓库根） | `AI SMOKE PASSED`（需已配置的模型；本次未跑） |
-| `pnpm test`（desktop） | `36 passed (5 文件)` |
+| `backend\.venv\Scripts\python.exe -m pytest`（backend） | `117 passed`（用 `-o addopts='' -q --tb=no` 取汇总；叠加 -q 无汇总行） |
+| `backend\.venv\Scripts\python.exe scripts\smoke_api.py`（仓库根） | `SMOKE PASSED: all checks green`（27 项） |
+| `backend\.venv\Scripts\python.exe scripts\smoke_ai.py --from-store`（仓库根） | `AI SMOKE PASSED`（需已配置的模型） |
+| `pnpm test`（desktop） | `37 passed (5 文件)`：utils 14 · ai 10 · text-edit 6 · api 4 · sidecar 3 |
 | `pnpm typecheck`（desktop） | 无输出（`tsc --noEmit` 干净） |
 | `pnpm build`（desktop） | `✓ built`，产出 `dist/` |
-| `cargo check`（desktop/src-tauri） | `Finished`，无 error（本次未跑） |
+| `cargo check`（desktop/src-tauri） | `Finished`，无 error |
 
-> **权威数字只在 [`09_Reports/ScanReports/Progress.md` §3](09_Reports/ScanReports/Progress.md) 维护**。旧文档（AGENTS/CODEBUDDY/CurrentStatus/README）仍写 60/29、96/32 等，属待同步项。
-> 实测用例分布（2026-11-16）：后端 15 文件约 105 例（AI 相关 8 文件 49 + 其余 7 文件 56）；前端 utils 14 · ai 9 · text-edit 6 · api 4 · sidecar 3 = 36。
+> **权威数字只在 [`09_Reports/ScanReports/Progress.md` §3](09_Reports/ScanReports/Progress.md) 维护**——数字随任务推进持续变化，本表是 2026-11-16 18:16 快照。改约定类文档（AGENTS/CODEBUDDY）判据写"全绿/无输出"，不含具体数字。
 
 ## 三条规则
 
