@@ -10,7 +10,6 @@
 
 | 编号 | 优先级 | 模块 | 现象 | 证据 | 修法 | 验证 | 状态 |
 |---|---|---|---|---|---|---|---|
-| T-08 | P1 | frontend | AI 面板无拒绝/丢弃，结果不持久化 | components/editor/ai-panel.tsx:293-311 | 加丢弃按钮并清空草稿；未完成流式结果落 drafts 并标注未完成 | 手动：点丢弃后正文与版本均不变 | 待办 |
 | T-09 | P1 | frontend | outline 与 write 两个后端操作无 UI 入口 | ai-panel.tsx:52-53 留空壳 | 补两个操作入口与占位提示 | 面板里可见 7 个操作 | 待办 |
 | T-10 | P1 | frontend | /operations /prompts /tasks 三个端点无消费方 | lib/ai.ts:48 只调 stream；types/api.ts:288 仅类型声明 | 操作列表与 prompt 列表改为从端点拉取；任务面板展示 token 与成本 | 手动：改内置模板后 UI 生效 | 待办 |
 | T-11 | P1 | rag | knowledge_chunks 无检索，长文只能靠章节截断 | models/novel.py:173-176；db/project_db.py:113 仅 count | 阶段 3：切分 + FTS5 + 向量 + 混合检索（设计见 docs/rag.md） | 阶段 3 验收判据全绿 | 待办 |
@@ -24,6 +23,8 @@
 | T-20 | P2 | editor | 编辑器无查找替换，撤销依赖 textarea 原生 | components/editor/chapter-editor.tsx 无 find/replace 实现 | 加查找替换浮层，支持全章匹配与替换 | 手动：查找命中高亮，替换后可撤销 | 待办 |
 | T-21 | P2 | data | paragraphs 表无写入方，只有切分函数 | models/novel.py:68 定义；仅 utils/text.py 有 split_paragraphs | 段落随章节保存写入，或明确删表并说明理由 | 保存章节后 paragraphs 有行，或表被删除并有记录 | 待办 |
 | T-25 | P1 | test | 无 E2E 黄金路径与 500 章合成语料 | tests 无 Playwright；无造语料脚本；正文只有单元与冒烟 | Playwright 跑一条主流程 + 脚本生成带标注的 500 章语料 | E2E 一条绿；语料脚本输出可复现 | 待办 |
+| T-29 | P2 | frontend | AI 生成结果不持久化，关面板即丢 | ai-panel.tsx 只有 apply/清空；未采纳的 output 无落盘；novel/drafts 目录未使用 | 未采纳输出落项目 drafts 目录并可在面板恢复 | 关面板重开仍能取回上次输出 | 待办 |
+| T-30 | P1 | ai | 大纲生成非流式，真实模型耗时 103 秒无任何反馈 | smoke_ai.py 实测 outline 103.7s；POST /ai/outline 无流式与进度 | 大纲走流式（边生成边解析）或加进度心跳与超时提示 | 前端在大纲生成期间有可见进度，且不超时断开 | 待办 |
 
 ## 2. 已关闭
 
@@ -36,6 +37,7 @@
 | T-05 | P0 | ai | PromptService 零测试，版本恒为 1，无覆盖端点 | ai/prompts/service.py:49-144；routes/ai.py:23-35 无写端点 | 加 PATCH /api/ai/prompts/{key}（写即 version+1）+ seed/resolve/render 测试 | pytest 新增 ≥3 用例；GET /prompts 能看到 version=2；实测：pytest -q → 87 collected, exit 0, 0 failed（基线 81 + 新增 6）; ruff check app tests → All checks passed!; smoke_api.py → SMOKE PASSED: all checks green | 已关闭 2026-11-16 — PromptService 新增 upsert_override（写即 version+1、保留旧版本、未知 key 抛 KeyError），新增 PATCH /api/ai/prompts/{key} 与 tests/test_prompt_service.py 6 条用例 |
 | T-06 | P0 | ai | 主备降级链零覆盖 | ai/llm/registry.py:69-128；tests/test_ai_adapters.py:58 | 补 fallback 测试：主模型 5xx → 备模型成功；流式已 emitted 不降级 | pytest 新增 ≥2 用例；实测：pytest -q (backend) → 96 passed, 0 failed；tests/test_llm_fallback.py -v → 9 passed；ruff check app tests → All checks passed | 已关闭 2026-11-16 — 新增 tests/test_llm_fallback.py 9 条用例覆盖 ChatClient 主备降级链（complete 降级/全链失败/401 不降级/adapter 重试优先/链路跳过不可用备模型/流式首 token 前降级/已 emitted 不降级），未改实现 |
 | T-07 | P1 | ai | agent_configs 零读写方，无法按 Agent 选模型 | models/studio.py:90-93；全仓引用仅模型层 4 处 | 按 operation 查 agent_configs 决定 model_config_id，缺省回落默认模型 | pytest：配置了绑定的 operation 走指定模型；实测：pytest -q → 101 passed（基线 96 + 新增 5；含配置绑定选模型/显式覆盖/未绑定回落默认）；ruff check app tests → All checks passed；smoke_api.py → SMOKE PASSED: all checks green | 已关闭 2026-11-16 — 新增 AgentConfigService + /api/agent-configs 端点，AIService._resolve_model 按 operation 解析：显式 id > agent 绑定 > 默认模型（只用于选模型，不套用 temperature/system_prompt） |
+| T-08 | P1 | frontend | AI 面板无拒绝/丢弃，结果不持久化 | components/editor/ai-panel.tsx:293-311 | 加丢弃按钮并清空草稿；未完成流式结果落 drafts 并标注未完成 | 手动：点丢弃后正文与版本均不变；实测：desktop: pnpm typecheck 无输出；pnpm test 32 passed / 5 files；pnpm build ✓ built in 1.20s；backend: pytest 101 passed in 47.26s | 已关闭 2026-11-16 — AI 面板加「丢弃」：abort 流式后清空 output/result/error 回 idle，不调 onApply；关闭面板时 output 非空先静默丢弃 |
 | T-16 | P2 | docs | development-plan.md 与代码严重不符 | docs/development-plan.md:107 写无 ai 包；实际 backend/app/ai 有 10 个 py | 按 CurrentStatus.md 重写 §3.2 与 §3.4 判据 | 文档中不再出现 AI 部分完全未开工；实测：docs/development-plan.md 全文替换，含 §9.1 已偿还 4 条 / §9.3 新增 4 条风险 | 已关闭 2026-11-16 — development-plan.md 已按代码重写（阶段2拆2a/2b、补AI层清单、风险表重写、验收可执行化） |
 | T-22 | P2 | realtime | 无 WebSocket，原计划要求 4 个 | api/routes 无 ws 路由；core/security.py 仅提及；实际用 SSE | 定策略：生成流用 SSE 写死进计划，任务状态用 WS 或轮询 | 计划文档里不再有悬空的 4 个 WS 接口；实测：docs/development-plan.md §10.5 明确不做 WebSocket；实测：docs/development-plan.md 10.5 明确不做 WebSocket | 已关闭 2026-11-16 — WS 策略定稿：生成流用 SSE，任务状态用轮询，4 个 WS 接口作废 |
 | T-23 | P2 | editor | Tiptap 已装未用，计划未记录 textarea 决策 | package.json 有 @tiptap 依赖；desktop/src 零引用；editor 用 textarea | 在开发计划 §5.2 与选型表标注 V1.x 用 textarea | 计划与代码不再互相矛盾；实测：docs/development-plan.md §3.4 决策定稿 + §10.5 明确不做；实测：docs/development-plan.md 3.4 决策定稿 + 10.5 明确不做 | 已关闭 2026-11-16 — Tiptap 决策定稿：V1.x 用 textarea，理由与演进路径已写入计划 |

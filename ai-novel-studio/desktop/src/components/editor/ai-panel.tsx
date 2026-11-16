@@ -8,6 +8,7 @@ import {
   RefreshCw,
   Sparkles,
   Square,
+  Trash2,
   TriangleAlert,
   Wand2,
   X,
@@ -139,6 +140,23 @@ export function AIPanel({
     setPhase("idle");
   };
 
+  /** 放弃本次生成结果：不动正文，只清空面板状态。 */
+  const discard = useCallback((silent = false) => {
+    controller.current?.abort();
+    controller.current = null;
+    setOutput("");
+    setResult(null);
+    setError(null);
+    setPhase("idle");
+    if (!silent) toast.success("已丢弃，正文未改动");
+  }, []);
+
+  const close = useCallback(() => {
+    // 关面板前先丢弃，避免「关了才想起来没采纳」的沉默丢失。
+    if (output.trim()) discard(true);
+    onClose();
+  }, [discard, onClose, output]);
+
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(output);
@@ -164,7 +182,7 @@ export function AIPanel({
           size="icon-sm"
           className="ml-auto"
           title="关闭 AI 面板"
-          onClick={onClose}
+          onClick={close}
         >
           <X className="size-4" />
         </Button>
@@ -288,33 +306,45 @@ export function AIPanel({
         </div>
       </ScrollArea>
 
-      {output && !busy && (
+      {output && (
         <div className="flex flex-wrap gap-1 border-t p-2">
           <Button size="sm" variant="ghost" onClick={() => void copy()} title="复制">
             <Copy className="size-3.5" />
           </Button>
-          {def.applies ? (
-            <>
-              {selection.trim() && (
-                <Button size="sm" variant="outline" onClick={() => apply("replace-selection")}>
-                  <Check className="size-3.5" />
-                  替换选中
+          {!busy &&
+            (def.applies ? (
+              <>
+                {selection.trim() && (
+                  <Button size="sm" variant="outline" onClick={() => apply("replace-selection")}>
+                    <Check className="size-3.5" />
+                    替换选中
+                  </Button>
+                )}
+                <Button size="sm" variant="outline" onClick={() => apply("append")}>
+                  <ArrowDownToLine className="size-3.5" />
+                  插入末尾
                 </Button>
-              )}
-              <Button size="sm" variant="outline" onClick={() => apply("append")}>
-                <ArrowDownToLine className="size-3.5" />
-                插入末尾
-              </Button>
-              <Button size="sm" variant="outline" onClick={() => apply("replace-all")}>
-                <RefreshCw className="size-3.5" />
-                替换全文
-              </Button>
-            </>
-          ) : (
-            <span className="px-1 py-1 text-[10px] text-muted-foreground">
-              审稿结果仅供参考，不会写入正文
-            </span>
-          )}
+                <Button size="sm" variant="outline" onClick={() => apply("replace-all")}>
+                  <RefreshCw className="size-3.5" />
+                  替换全文
+                </Button>
+              </>
+            ) : (
+              <span className="px-1 py-1 text-[10px] text-muted-foreground">
+                审稿结果仅供参考，不会写入正文
+              </span>
+            ))}
+          <Button
+            size="sm"
+            variant="ghost"
+            className="ml-auto text-muted-foreground"
+            disabled={!output.trim()}
+            onClick={() => discard()}
+            title="丢弃这次结果，正文不改动"
+          >
+            <Trash2 className="size-3.5" />
+            丢弃
+          </Button>
         </div>
       )}
     </div>
