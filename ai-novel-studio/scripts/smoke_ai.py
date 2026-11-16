@@ -4,10 +4,16 @@ Creates a throwaway project in a temporary data directory, then runs one
 non-streaming operation and one streaming operation against the real provider.
 The API key comes from the environment (see ``configure_model.py``).
 
-    $env:MINIMAX_API_KEY = "<key>"
+推荐直接用应用里已保存的默认模型（含 DPAPI 加密的密钥），不写死任何模型名：
+
+    backend/.venv/Scripts/python.exe scripts/smoke_ai.py --from-store
+
+也可以显式指定（两者都给）：
+
+    $env:MODEL_API_KEY = "<key>"
     backend/.venv/Scripts/python.exe scripts/smoke_ai.py `
-        --base-url https://api.minimax.io/v1 `
-        --model MiniMax-M2 `
+        --base-url https://<your-gateway>/v1 `
+        --model <model-name> `
         --context-window 200000
 
 Exits non-zero if any step fails. Nothing is written to the real library.
@@ -21,6 +27,7 @@ import os
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
@@ -53,24 +60,56 @@ def check(label: str, condition: bool, detail: str = "") -> None:
     print(f"[{'PASS' if condition else 'FAIL'}] {label}" + (f"  ({detail})" if detail and not condition else ""))
 
 
-async def drain(events, started: float):
-    """Consume one streamed generation: (deltas, done, error, text, first_at)."""
-    deltas = 0
-    done_payload: dict | None = None
-    error_payload: dict | None = None
+@dataclass
+class Drained:
+    """What one streamed generation produced, with both frame timings."""
+
+    deltas: int = 0
+    thoughts: int = 0
+    done: dict | None = None
+    error: dict | None = None
+    text: str = ""
+    thinking: str = ""
+    first_delta_at: float | None = None
+    first_thinking_at: float | None = None
+
+
+async def drain(events, started: float) -> Drained:
+    """Consume one streamed generation, timing the thinking and text frames."""
+    out = Drained()
     parts: list[str] = []
-    first_at: float | None = None
+    thoughts: list[str] = []
     async for event in events:
-        if event.type == "delta":
-            deltas += 1
-            if first_at is None:
-                first_at = time.perf_counter() - started
+        if event.type == "thinking":
+            out.thoughts += 1
+            if out.first_thinking_at is None:
+                out.first_thinking_at = time.perf_counter() - started
+            thoughts.append(event.text)
+        elif event.type == "delta":
+            out.deltas += 1
+            if out.first_delta_at is None:
+                out.first_delta_at = time.perf_counter() - started
             parts.append(event.text)
         elif event.type == "done":
-            done_payload = event.data
+            out.done = event.data
         else:
-            error_payload = event.data
-    return deltas, done_payload, error_payload, "".join(parts), first_at
+            out.error = event.data
+    out.text = "".join(parts)
+    out.thinking = "".join(thoughts)
+    return out
+
+
+def _seconds(value: float | None) -> str:
+    return "—" if value is None else f"{value:.2f}s"
+
+
+def frame_lines(drained: Drained) -> None:
+    """Print the two frame timings this check exists for (thinking ≪ delta)."""
+    if not drained.thoughts:
+        print("  首个 thinking 帧 — ·（该模型本次未返回思考内容）")
+    print(f"  首个 thinking 帧 {_seconds(drained.first_thinking_at)} · 首个 delta 帧 {_seconds(drained.first_delta_at)}")
+    if drained.thoughts:
+        print(f"  思考帧 {drained.thoughts} 个 / {len(drained.thinking)} 字（不计入正文）")
 
 
 def spend_line(runtime: Runtime, project_id: str, kind: str, elapsed: float) -> None:
@@ -120,6 +159,10 @@ async def main_async(args: argparse.Namespace) -> int:
 
     if not key:
         print("缺少密钥：请设置环境变量 MINIMAX_API_KEY，或加 --from-store 使用应用里保存的模型。")
+        return 2
+
+    if not args.from_store and (not args.base_url or not args.model):
+        print("缺少 --base-url / --model：推荐直接加 --from-store，用应用里已保存的模型。")
         return 2
 
     data_dir = Path(tempfile.mkdtemp(prefix="novel-studio-ai-smoke-"))
@@ -193,15 +236,8 @@ async def main_async(args: argparse.Namespace) -> int:
         # 2. Streaming continue -------------------------------------------
         print("→ 续写（流式）…")
         started = time.perf_counter()
-        deltas = 0
-        first_token_at: float | None = None
-        text_parts: list[str] = []
-        done_payload: dict | None = None
-        error_payload: dict | None = None
-
-        async def consume() -> None:
-            nonlocal deltas, first_token_at, done_payload, error_payload
-            async for event in runtime.ai.stream(
+        drained = await drain(
+            runtime.ai.stream(
                 "continue",
                 AIRequest(
                     project_id=project.id,
@@ -210,27 +246,29 @@ async def main_async(args: argparse.Namespace) -> int:
                     temperature=0.7,
                     model_config_id=model.id,
                 ),
-            ):
-                if event.type == "delta":
-                    deltas += 1
-                    if first_token_at is None:
-                        first_token_at = time.perf_counter() - started
-                    text_parts.append(event.text)
-                elif event.type == "done":
-                    done_payload = event.data
-                else:
-                    error_payload = event.data
-
-        await consume()
+            ),
+            started,
+        )
         elapsed = time.perf_counter() - started
 
-        check("流式没有报错", error_payload is None, str(error_payload))
-        check("收到增量文本", deltas > 1, f"{deltas} 个增量")
-        check("完成事件带用量", bool(done_payload and done_payload.get("output_tokens")), str(done_payload))
-        if first_token_at is not None:
-            print(f"  首字延迟 {first_token_at:.2f}s · 总耗时 {elapsed:.1f}s · {deltas} 个增量")
+        check("流式没有报错", drained.error is None, str(drained.error))
+        check("收到增量文本", drained.deltas > 1, f"{drained.deltas} 个增量")
+        check(
+            "完成事件带用量",
+            bool(drained.done and drained.done.get("output_tokens")),
+            str(drained.done),
+        )
+        # The whole point of T-36: reasoning tokens arrive long before the first
+        # character of the answer, and must not be spliced into it.
+        check(
+            "思考内容未混入正文",
+            not drained.thinking or drained.thinking[:20] not in drained.text,
+        )
+        if drained.first_delta_at is not None:
+            print(f"  首字延迟 {drained.first_delta_at:.2f}s · 总耗时 {elapsed:.1f}s · {drained.deltas} 个增量")
+        frame_lines(drained)
         print("  结果预览：")
-        for line in "".join(text_parts).strip().splitlines()[:5]:
+        for line in drained.text.strip().splitlines()[:5]:
             print(f"    {line}")
         print()
 
@@ -294,38 +332,42 @@ async def main_async(args: argparse.Namespace) -> int:
         # 4b. Streamed outline + summary (T-30) -------------------------------
         print("→ 章节大纲（流式，强制重算）…")
         started = time.perf_counter()
-        deltas, done, error, _text, first_at = await drain(
+        streamed = await drain(
             runtime.ai.stream_outline(
                 project.id, chapter.id, force=True, model_config_id=model.id
             ),
             started,
         )
         elapsed = time.perf_counter() - started
-        check("流式大纲没有报错", error is None, str(error))
-        check("流式大纲收到增量", deltas > 1, f"{deltas} 个增量")
+        done = streamed.done
+        check("流式大纲没有报错", streamed.error is None, str(streamed.error))
+        check("流式大纲收到增量", streamed.deltas > 1, f"{streamed.deltas} 个增量")
         check("流式大纲已落库", bool(done and done.get("outline_id")), str(done)[:160])
-        if first_at is not None:
-            print(f"  首字延迟 {first_at:.2f}s · 总耗时 {elapsed:.1f}s · {deltas} 个增量")
+        if streamed.first_delta_at is not None:
+            print(f"  首字延迟 {streamed.first_delta_at:.2f}s · 总耗时 {elapsed:.1f}s · {streamed.deltas} 个增量")
+        frame_lines(streamed)
         print()
 
         print("→ 章节摘要（流式，强制重算）…")
         started = time.perf_counter()
-        deltas, done, error, _text, first_at = await drain(
+        streamed = await drain(
             runtime.ai.stream_summary(
                 project.id, chapter.id, force=True, model_config_id=model.id
             ),
             started,
         )
         elapsed = time.perf_counter() - started
-        check("流式摘要没有报错", error is None, str(error))
-        check("流式摘要收到增量", deltas > 0, f"{deltas} 个增量")
+        done = streamed.done
+        check("流式摘要没有报错", streamed.error is None, str(streamed.error))
+        check("流式摘要收到增量", streamed.deltas > 0, f"{streamed.deltas} 个增量")
         check(
             "流式摘要非空",
             bool(done and (done.get("summary") or "").strip()),
             str(done)[:160],
         )
-        if first_at is not None:
-            print(f"  首字延迟 {first_at:.2f}s · 总耗时 {elapsed:.1f}s · {deltas} 个增量")
+        if streamed.first_delta_at is not None:
+            print(f"  首字延迟 {streamed.first_delta_at:.2f}s · 总耗时 {elapsed:.1f}s · {streamed.deltas} 个增量")
+        frame_lines(streamed)
         spend_line(runtime, project.id, "ai.summary", elapsed)
         print()
 
@@ -378,9 +420,12 @@ async def main_async(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a real AI smoke test.")
-    parser.add_argument("--base-url", default="https://api.minimax.io/v1")
-    parser.add_argument("--model", default="MiniMax-M2")
-    parser.add_argument("--provider", default="minimax")
+    # No hard-coded defaults: a stale model name here reads like "this is what
+    # you are testing" and has already caused a wrong report once. Use
+    # ``--from-store`` (recommended) or pass both ``--base-url`` and ``--model``.
+    parser.add_argument("--base-url", default="")
+    parser.add_argument("--model", default="")
+    parser.add_argument("--provider", default="openai_compatible")
     parser.add_argument(
         "--from-store",
         action="store_true",

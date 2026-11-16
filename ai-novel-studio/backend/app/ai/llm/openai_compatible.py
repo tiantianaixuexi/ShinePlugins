@@ -268,7 +268,16 @@ class OpenAICompatibleAdapter(BaseAdapter):
                         if not choices:
                             continue
                         choice = choices[0] or {}
-                        piece = (choice.get("delta") or {}).get("content")
+                        delta = choice.get("delta") or {}
+                        # Reasoning models (e.g. MiniMax M3.1, DeepSeek-R1) stream
+                        # their chain of thought first under a separate key. It must
+                        # never be appended to the answer text.
+                        thought = delta.get("reasoning_content")
+                        if not isinstance(thought, str) or not thought:
+                            thought = delta.get("reasoning")
+                        if isinstance(thought, str) and thought:
+                            yield StreamChunk(thinking=thought)
+                        piece = delta.get("content")
                         if piece:
                             produced.append(piece)
                             yield StreamChunk(text=piece)

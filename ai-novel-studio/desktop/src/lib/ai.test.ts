@@ -138,6 +138,46 @@ describe("streamAI", () => {
     expect(state.deltas.join("")).toBe("好");
     expect(state.done).not.toBeNull();
   });
+
+  it("routes thinking frames into their own buffer (T-36)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        sseResponse([
+          'event: thinking\ndata: {"text":"先想"}\n\n',
+          'event: thinking\ndata: {"text":"再想"}\n\n',
+          'event: delta\ndata: {"text":"你"}\n\n',
+          'event: delta\ndata: {"text":"好"}\n\n',
+          `event: done\ndata: ${JSON.stringify(DONE)}\n\n`,
+        ]),
+      ),
+    );
+
+    const order: string[] = [];
+    let output = "";
+    let thinking = "";
+    await streamAI("polish", { project_id: "p" }, {
+      onDelta: (text) => {
+        order.push("delta");
+        output += text;
+      },
+      onThinking: (text) => {
+        order.push("thinking");
+        thinking += text;
+      },
+      onDone: () => undefined,
+      onError: (payload) => {
+        throw new Error(`${payload.code}: ${payload.message}`);
+      },
+    });
+
+    // The chain of thought arrives first, and never joins the answer buffer …
+    expect(order.slice(0, 2)).toEqual(["thinking", "thinking"]);
+    expect(thinking).toBe("先想再想");
+    expect(output).toBe("你好");
+    // … and a thinking outcome is a no-op for the answer accumulator.
+    expect(applyStreamOutcome(output, { kind: "thinking", text: "再想" })).toBe("你好");
+  });
 });
 
 describe("applyStreamOutcome", () => {

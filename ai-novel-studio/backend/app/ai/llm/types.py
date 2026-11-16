@@ -56,10 +56,12 @@ class LLMResponse:
 class StreamChunk:
     """One streamed increment.
 
-    ``text`` is the delta to append; ``usage`` and ``finish_reason`` appear on
-    the final chunk only.
+    ``text`` is the delta to append; ``thinking`` carries a reasoning/thinking
+    delta from reasoning models (never part of the answer text); ``usage`` and
+    ``finish_reason`` appear on the final chunk only.
     """
 
     text: str = ""
+    thinking: str = ""
     usage: LLMUsage | None = None
     finish_reason: str | None = None

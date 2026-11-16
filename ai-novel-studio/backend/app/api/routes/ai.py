@@ -33,6 +33,13 @@ def _sse(event: AIStreamEvent) -> dict[str, str]:
             "event": "delta",
             "data": json.dumps({"text": event.text}, ensure_ascii=False),
         }
+    if event.type == "thinking":
+        # Chain-of-thought from reasoning models: same shape as ``delta`` but a
+        # distinct event name, so clients never fold it into the answer text.
+        return {
+            "event": "thinking",
+            "data": json.dumps({"text": event.text}, ensure_ascii=False),
+        }
     # ``reset`` (the JSON repair restarted the reply) carries no payload and
     # falls into this generic branch: ``event: reset`` + ``data: {}``.
     return {

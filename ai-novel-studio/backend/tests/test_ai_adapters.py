@@ -239,6 +239,61 @@ async def test_stream_collects_deltas_and_usage() -> None:
     assert usage == LLMUsage(input_tokens=5, output_tokens=2)
 
 
+async def test_stream_surfaces_reasoning_content_separately() -> None:
+    """T-36: reasoning models stream chain-of-thought before the answer."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return sse(
+            'data: {"choices":[{"delta":{"reasoning_content":"先想"}}]}',
+            'data: {"choices":[{"delta":{"reasoning_content":"再想"}}]}',
+            'data: {"choices":[{"delta":{"content":"你"}}]}',
+            'data: {"choices":[{"delta":{"content":"好"}}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        )
+
+    adapter = make_adapter(handler)
+
+    kinds: list[str] = []
+    thought: list[str] = []
+    text: list[str] = []
+    usage: LLMUsage | None = None
+    async for chunk in adapter.stream(make_request()):
+        if chunk.thinking:
+            kinds.append("thinking")
+            thought.append(chunk.thinking)
+        if chunk.text:
+            kinds.append("text")
+            text.append(chunk.text)
+        if chunk.usage is not None:
+            usage = chunk.usage
+
+    assert kinds == ["thinking", "thinking", "text", "text"]
+    assert "".join(thought) == "先想再想"
+    # The chain of thought never leaks into the answer body …
+    assert "".join(text) == "你好"
+    # … nor into the usage estimate, which is derived from the answer only.
+    assert usage is not None
+    assert usage.output_tokens == 2
+
+
+async def test_stream_accepts_legacy_reasoning_key() -> None:
+    """Some providers name the same delta ``reasoning`` instead."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return sse(
+            'data: {"choices":[{"delta":{"reasoning":"想一想"}}]}',
+            'data: {"choices":[{"delta":{"content":"好"}}]}',
+            "data: [DONE]",
+        )
+
+    adapter = make_adapter(handler)
+
+    chunks = [chunk async for chunk in adapter.stream(make_request())]
+    assert [c.thinking for c in chunks if c.thinking] == ["想一想"]
+    assert "".join(c.text for c in chunks) == "好"
+
+
 async def test_stream_ignores_malformed_frames() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return sse(

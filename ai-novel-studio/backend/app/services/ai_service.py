@@ -54,7 +54,9 @@ class AIStreamEvent:
 
     #: ``reset`` tells the client to throw away every ``delta`` received so far:
     #: the reply is being regenerated from scratch (the JSON repair retry).
-    type: Literal["delta", "reset", "done", "error"]
+    #: ``thinking`` carries a reasoning-model chain-of-thought delta; it is shown
+    #: separately by the UI and is **never** part of the answer text.
+    type: Literal["delta", "thinking", "reset", "done", "error"]
     text: str = ""
     data: dict[str, Any] = field(default_factory=dict)
 
@@ -283,6 +285,10 @@ class AIService:
 
         try:
             async for chunk in self.chat.stream(request, model_config_id=model.id):
+                if chunk.thinking:
+                    # Chain-of-thought: forwarded for display only, never stored
+                    # in ``produced`` and never billed as answer text.
+                    yield AIStreamEvent(type="thinking", text=chunk.thinking)
                 if chunk.text:
                     produced.append(chunk.text)
                     yield AIStreamEvent(type="delta", text=chunk.text)
@@ -356,6 +362,10 @@ class AIService:
         request.json_mode = True
 
         async for chunk in self.chat.stream(request, model_config_id=model.id):
+            if chunk.thinking:
+                # Kept out of ``produced``: the JSON parse must only ever see the
+                # answer body, never the chain of thought.
+                yield AIStreamEvent(type="thinking", text=chunk.thinking)
             if chunk.text:
                 produced.append(chunk.text)
                 yield AIStreamEvent(type="delta", text=chunk.text)

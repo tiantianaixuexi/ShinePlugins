@@ -41,6 +41,8 @@ class MockProvider:
 
     def __init__(self) -> None:
         self.stream_pieces: tuple[str, ...] = (SUMMARY_JSON,)
+        #: Chain-of-thought the provider streams *before* the answer (T-36).
+        self.thought_pieces: tuple[str, ...] = ()
         self.plain_reply: str = SUMMARY_JSON
         self.requests: list[dict[str, Any]] = []
         self.url = ""
@@ -55,7 +57,7 @@ class _Handler(BaseHTTPRequestHandler):
         provider.requests.append(body)
 
         if body.get("stream"):
-            self._stream(provider.stream_pieces)
+            self._stream(provider.thought_pieces, provider.stream_pieces)
         else:
             self._json(provider.plain_reply)
 
@@ -75,11 +77,15 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
         self.wfile.flush()
 
-    def _stream(self, pieces: tuple[str, ...]) -> None:
+    def _stream(self, thoughts: tuple[str, ...], pieces: tuple[str, ...]) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
+        for thought in thoughts:
+            frame = {"choices": [{"delta": {"reasoning_content": thought}}]}
+            self.wfile.write(f"data: {json.dumps(frame, ensure_ascii=False)}\n\n".encode())
+            self.wfile.flush()
         for piece in pieces:
             frame = {"choices": [{"delta": {"content": piece}}]}
             self.wfile.write(f"data: {json.dumps(frame, ensure_ascii=False)}\n\n".encode())
@@ -276,6 +282,47 @@ def test_outline_stream_repairs_a_non_json_reply(
 
     # One streaming call, then one non-streaming repair.
     assert [call.get("stream") for call in provider.requests] == [True, False]
+
+
+def test_thinking_frames_do_not_pollute_the_json_reply(
+    client: TestClient, auth: dict[str, str], provider: MockProvider
+) -> None:
+    """T-36: a reasoning model's chain-of-thought arrives as its own event.
+
+    The answer body must still parse into the same structured payload, and the
+    thought text must never appear inside the ``delta`` frames a client
+    concatenates as the article.
+    """
+    provider.thought_pieces = ("先想", "标题要一致")
+    provider.stream_pieces = (OUTLINE_JSON,)
+    _model_id, project_id, chapter_id = _seed(client, auth, provider.url)
+
+    with client.stream(
+        "POST",
+        f"/api/ai/outline/{chapter_id}/stream",
+        headers=auth,
+        json={"project_id": project_id, "force": True},
+    ) as response:
+        assert response.status_code == 200, response.text
+        events = _collect_sse(response)
+
+    names = [name for name, _data in events]
+    assert "thinking" in names, names
+    # Reasoning always precedes the answer: that is the whole point of T-36.
+    assert names.index("thinking") < names.index("delta")
+
+    assert "".join(data["text"] for name, data in events if name == "thinking") == "先想标题要一致"
+    deltas = "".join(data["text"] for name, data in events if name == "delta")
+    assert deltas == OUTLINE_JSON
+    assert "先想" not in deltas
+
+    done = [data for name, data in events if name == "done"]
+    assert done, f"missing done frame: {events}"
+    assert done[0]["degraded"] is False
+    assert done[0]["title"] == "第一章 雨夜"
+    assert done[0]["goal"] == "等第三声梆子"
+    # Usage stays the provider's answer-only accounting.
+    assert done[0]["usage"] == {"input_tokens": 11, "output_tokens": 5}
 
 
 def test_summary_stream_reports_failure_as_error_frame(

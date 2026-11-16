@@ -12,6 +12,11 @@ import type {
 export interface AIStreamHandlers {
   onDelta: (text: string) => void;
   /**
+   * Chain-of-thought delta from a reasoning model. Shown in its own pane and
+   * never appended to the answer text.
+   */
+  onThinking?: (text: string) => void;
+  /**
    * The server is regenerating the reply from scratch (the JSON repair retry).
    * Everything received so far must be thrown away before the next `delta`.
    */
@@ -23,6 +28,7 @@ export interface AIStreamHandlers {
 /** Handlers for the structured (summary / outline) streams. */
 export interface StructuredStreamHandlers<T> {
   onDelta: (text: string) => void;
+  onThinking?: (text: string) => void;
   onReset?: () => void;
   onDone: (payload: T) => void;
   onError: (payload: { code: string; message: string }) => void;
@@ -36,6 +42,7 @@ export interface SSEFrame {
 /** What one SSE frame means, once decoded. Pure, so it is unit-testable. */
 export type StreamOutcome =
   | { kind: "delta"; text: string }
+  | { kind: "thinking"; text: string }
   | { kind: "reset" }
   | { kind: "done"; data: unknown }
   | { kind: "error"; code: string; message: string }
@@ -61,11 +68,14 @@ export function parseFrame(block: string): SSEFrame | null {
  */
 export function interpretFrame(frame: SSEFrame): StreamOutcome {
   switch (frame.event) {
-    case "delta": {
+    case "delta":
+    case "thinking": {
       try {
         const parsed = JSON.parse(frame.data) as { text?: unknown };
         if (typeof parsed?.text === "string" && parsed.text) {
-          return { kind: "delta", text: parsed.text };
+          return frame.event === "thinking"
+            ? { kind: "thinking", text: parsed.text }
+            : { kind: "delta", text: parsed.text };
         }
       } catch {
         // Incomplete or garbled frame: the next one carries text.
@@ -224,6 +234,9 @@ export async function streamAI(
       case "delta":
         handlers.onDelta(outcome.text);
         return false;
+      case "thinking":
+        handlers.onThinking?.(outcome.text);
+        return false;
       case "reset":
         handlers.onReset?.();
         return false;
@@ -257,6 +270,9 @@ export async function streamSummary(
       switch (outcome.kind) {
         case "delta":
           handlers.onDelta(outcome.text);
+          return false;
+        case "thinking":
+          handlers.onThinking?.(outcome.text);
           return false;
         case "reset":
           handlers.onReset?.();
@@ -292,6 +308,9 @@ export async function streamOutline(
       switch (outcome.kind) {
         case "delta":
           handlers.onDelta(outcome.text);
+          return false;
+        case "thinking":
+          handlers.onThinking?.(outcome.text);
           return false;
         case "reset":
           handlers.onReset?.();

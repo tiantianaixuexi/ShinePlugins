@@ -7,15 +7,15 @@ key only exists inside the user's application data directory.
 
 Examples (PowerShell)::
 
-    $env:MINIMAX_API_KEY = "<key>"
+    $env:MODEL_API_KEY = "<key>"
     backend/.venv/Scripts/python.exe scripts/configure_model.py `
-        --name "MiniMax" --provider minimax `
-        --base-url https://api.minimax.io/v1 `
-        --model MiniMax-M2 `
+        --name "<display name>" --provider openai_compatible `
+        --base-url https://<your-gateway>/v1 `
+        --model <model-name> `
         --context-window 200000 --max-output 8192 --set-default
 
     # update an existing row instead of creating a new one
-    ... configure_model.py --model-id mdl_xxx --model MiniMax-M2.1
+    ... configure_model.py --model-id mdl_xxx --model <new-model-name>
 """
 
 from __future__ import annotations

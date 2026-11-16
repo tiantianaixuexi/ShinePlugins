@@ -103,6 +103,12 @@ export function AIPanel({
   const [instruction, setInstruction] = useState("");
   const [phase, setPhase] = useState<Phase>("idle");
   const [output, setOutput] = useState("");
+  /**
+   * Chain-of-thought from reasoning models (MiniMax M3.1, DeepSeek-R1, …).
+   * Kept in its own buffer: it is shown while waiting for the first character
+   * of the answer, and must never reach the manuscript.
+   */
+  const [thinking, setThinking] = useState("");
   const [result, setResult] = useState<AIResult | null>(null);
   const [summary, setSummary] = useState<SummaryStreamResult | null>(null);
   const [outline, setOutline] = useState<OutlineStreamResult | null>(null);
@@ -113,7 +119,14 @@ export function AIPanel({
   const controller = useRef<AbortController | null>(null);
   const startedAt = useRef(0);
   const firstCharAt = useRef<number | null>(null);
+  const thinkingBox = useRef<HTMLDivElement | null>(null);
   const def = OPERATIONS.find((item) => item.id === operation) ?? OPERATIONS[0];
+
+  // Keep the reasoning pane pinned to the newest line.
+  useEffect(() => {
+    const box = thinkingBox.current;
+    if (box) box.scrollTop = box.scrollHeight;
+  }, [thinking]);
 
   // A ticking clock, so 「已用时」 keeps moving during a 100-second outline call.
   useEffect(() => {
@@ -148,17 +161,28 @@ export function AIPanel({
     setElapsedMs(0);
     setPhase("streaming");
     setOutput("");
+    setThinking("");
     setResult(null);
     setSummary(null);
     setOutline(null);
     setError(null);
 
+    /** 首帧计时：思考帧也算「有东西回来了」，否则推理模型会长时间显示「首字 —」。 */
+    const markFirstFrame = () => {
+      if (firstCharAt.current !== null) return;
+      firstCharAt.current = performance.now();
+      setFirstCharMs(firstCharAt.current - startedAt.current);
+    };
+
+    const appendThinking = (text: string) => {
+      if (abort.signal.aborted) return;
+      markFirstFrame();
+      setThinking((previous) => previous + text);
+    };
+
     const appendDelta = (text: string) => {
       if (abort.signal.aborted) return;
-      if (firstCharAt.current === null) {
-        firstCharAt.current = performance.now();
-        setFirstCharMs(firstCharAt.current - startedAt.current);
-      }
+      markFirstFrame();
       setOutput((previous) => applyStreamOutcome(previous, { kind: "delta", text }));
     };
 
@@ -189,6 +213,7 @@ export function AIPanel({
         { project_id: projectId, force },
         {
           onDelta: appendDelta,
+          onThinking: appendThinking,
           onReset: dropDeltas,
           onDone: (payload) => {
             if (abort.signal.aborted) return;
@@ -208,6 +233,7 @@ export function AIPanel({
         { project_id: projectId, force, instruction },
         {
           onDelta: appendDelta,
+          onThinking: appendThinking,
           onReset: dropDeltas,
           onDone: (payload) => {
             if (abort.signal.aborted) return;
@@ -232,6 +258,7 @@ export function AIPanel({
       },
       {
         onDelta: appendDelta,
+        onThinking: appendThinking,
         onReset: dropDeltas,
         onDone: (payload) => {
           if (abort.signal.aborted) return;
@@ -249,6 +276,7 @@ export function AIPanel({
     onApply(output, mode);
     toast.success("已写入正文");
     setOutput("");
+    setThinking("");
     setResult(null);
     setPhase("idle");
   };
@@ -258,6 +286,7 @@ export function AIPanel({
     controller.current?.abort();
     controller.current = null;
     setOutput("");
+    setThinking("");
     setResult(null);
     setSummary(null);
     setOutline(null);
@@ -328,6 +357,7 @@ export function AIPanel({
                 setOperation(item.id);
                 setPhase("idle");
                 setOutput("");
+                setThinking("");
                 setResult(null);
                 setSummary(null);
                 setOutline(null);
@@ -413,6 +443,48 @@ export function AIPanel({
               {firstCharMs === null ? "—" : `${(firstCharMs / 1000).toFixed(1)}s`} · 已用时{" "}
               {(elapsedMs / 1000).toFixed(1)}s
             </p>
+          )}
+
+          {/* 推理模型的思考过程：独立灰字区，既不进正文，也不进「已接收」字数。 */}
+          {thinking && (
+            <div className="mb-2 rounded-lg border border-dashed bg-muted/30 p-2">
+              <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
+                {busy ? (
+                  <>
+                    <Loader2 className="size-3 animate-spin" />
+                    思考中…
+                  </>
+                ) : (
+                  <span>思考过程（未计入正文）</span>
+                )}
+                {!busy && (
+                  <button
+                    type="button"
+                    className="ml-auto text-[10px] hover:text-foreground"
+                    onClick={() => setThinking("")}
+                  >
+                    清空
+                  </button>
+                )}
+              </div>
+              {busy ? (
+                <div
+                  ref={thinkingBox}
+                  className="mt-1 max-h-24 overflow-y-auto whitespace-pre-wrap break-all font-mono text-[10px] leading-relaxed text-muted-foreground/80"
+                >
+                  {thinking}
+                </div>
+              ) : (
+                <details className="mt-1">
+                  <summary className="cursor-pointer text-[10px] text-muted-foreground/70">
+                    展开查看（{countWords(thinking)} 字）
+                  </summary>
+                  <div className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap break-all font-mono text-[10px] leading-relaxed text-muted-foreground/80">
+                    {thinking}
+                  </div>
+                </details>
+              )}
+            </div>
           )}
 
           {phase === "error" && error && (
