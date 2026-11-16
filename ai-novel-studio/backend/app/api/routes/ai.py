@@ -21,8 +21,24 @@ from app.schemas.ai import (
     SummaryRequest,
     SummaryResult,
 )
+from app.services.ai_service import AIStreamEvent
 
 router = APIRouter(prefix="/ai", tags=["ai"])
+
+
+def _sse(event: AIStreamEvent) -> dict[str, str]:
+    """Frame one service event for ``EventSourceResponse``."""
+    if event.type == "delta":
+        return {
+            "event": "delta",
+            "data": json.dumps({"text": event.text}, ensure_ascii=False),
+        }
+    # ``reset`` (the JSON repair restarted the reply) carries no payload and
+    # falls into this generic branch: ``event: reset`` + ``data: {}``.
+    return {
+        "event": event.type,
+        "data": json.dumps(event.data, ensure_ascii=False),
+    }
 
 
 @router.get("/operations", summary="Available writing operations")
@@ -120,6 +136,56 @@ async def generate_outline(
     )
 
 
+@router.post(
+    "/summary/{chapter_id}/stream",
+    summary="Summarise one chapter and stream the reply",
+)
+async def stream_summary(
+    chapter_id: str, payload: SummaryRequest, service: AIServiceDep
+) -> EventSourceResponse:
+    """Streaming twin of ``POST /ai/summary/{chapter_id}``.
+
+    Registered before ``/{operation}`` like its non-streaming sibling. The
+    chapter (404) and the model (422) are resolved **before** the stream opens,
+    so a broken configuration still arrives as a normal HTTP error.
+    """
+    service.preflight_summary(payload.project_id, chapter_id)
+
+    async def events():
+        async for event in service.stream_summary(
+            payload.project_id, chapter_id, force=payload.force
+        ):
+            yield _sse(event)
+
+    return EventSourceResponse(events())
+
+
+@router.post(
+    "/outline/{chapter_id}/stream",
+    summary="Generate a chapter outline and stream the reply",
+)
+async def stream_outline(
+    chapter_id: str, payload: OutlineRequest, service: AIServiceDep
+) -> EventSourceResponse:
+    """Streaming twin of ``POST /ai/outline/{chapter_id}``.
+
+    Outline calls are the slowest in the product, so this is the endpoint the
+    desktop client should prefer; the payload is persisted exactly as before.
+    """
+    service.preflight_outline(payload.project_id, chapter_id)
+
+    async def events():
+        async for event in service.stream_outline(
+            payload.project_id,
+            chapter_id,
+            force=payload.force,
+            instruction=payload.instruction,
+        ):
+            yield _sse(event)
+
+    return EventSourceResponse(events())
+
+
 @router.post("/{operation}", response_model=AIResult, summary="Run a writing operation")
 async def run_ai(operation: str, payload: AIRequest, service: AIServiceDep) -> AIResult:
     return await service.run(operation, payload)
@@ -135,21 +201,7 @@ async def stream_ai(
 
     async def events():
         async for event in service.stream(operation, payload):
-            if event.type == "delta":
-                yield {
-                    "event": "delta",
-                    "data": json.dumps({"text": event.text}, ensure_ascii=False),
-                }
-            elif event.type == "done":
-                yield {
-                    "event": "done",
-                    "data": json.dumps(event.data, ensure_ascii=False),
-                }
-            else:
-                yield {
-                    "event": "error",
-                    "data": json.dumps(event.data, ensure_ascii=False),
-                }
+            yield _sse(event)
 
     return EventSourceResponse(events())
 

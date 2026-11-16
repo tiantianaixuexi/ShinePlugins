@@ -25,7 +25,7 @@ from app.ai.llm.registry import ChatClient
 from app.ai.llm.types import ChatMessage, LLMRequest, LLMUsage
 from app.ai.prompts.builtin import OPERATIONS, OUTLINE_PROMPT_KEY, SUMMARY_PROMPT_KEY
 from app.ai.prompts.service import PromptService, render
-from app.ai.structured import as_str_list, complete_json
+from app.ai.structured import REPAIR_INSTRUCTION, as_str_list, complete_json, parse_json_object
 from app.core.errors import NotFound, ProviderError, ValidationFailed
 from app.core.ids import new_id
 from app.core.logging import get_logger
@@ -52,9 +52,27 @@ MAX_CONTEXT_CHARS = 24_000
 class AIStreamEvent:
     """One server-sent event for a streaming generation."""
 
-    type: Literal["delta", "done", "error"]
+    #: ``reset`` tells the client to throw away every ``delta`` received so far:
+    #: the reply is being regenerated from scratch (the JSON repair retry).
+    type: Literal["delta", "reset", "done", "error"]
     text: str = ""
     data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _Streamed:
+    """Accumulator for one streamed structured reply.
+
+    The ``delta`` frames are yielded straight to the client, so the assembled
+    text lives here instead of being returned from the generator.
+    """
+
+    text: str = ""
+    usage: LLMUsage = field(default_factory=LLMUsage)
+
+
+def _usage_dict(usage: LLMUsage) -> dict[str, int]:
+    return {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens}
 
 
 def _truncate(text: str, limit: int, *, from_end: bool = False) -> str:
@@ -317,6 +335,87 @@ class AIService:
                 )
 
     # ------------------------------------------------------------------
+    # Streamed structured replies (summary / outline)
+    # ------------------------------------------------------------------
+    async def _stream_json(
+        self, model: ModelConfig, request: LLMRequest, out: _Streamed
+    ) -> AsyncIterator[AIStreamEvent]:
+        """Stream one JSON-shaped reply, repairing a non-JSON answer **once**.
+
+        Yields ``delta`` frames for the first attempt *and* for the repair, so
+        the UI keeps moving during the long calls real models make. ``out.text``
+        always ends up holding exactly one reply: the repair **replaces** the
+        first attempt instead of being appended to it, which is why the caller
+        re-parses ``out.text`` afterwards and never concatenates the two.
+
+        A ``reset`` frame is emitted right before the repair, so a client that
+        concatenates deltas (the only thing a dumb client can do) still ends up
+        with the repaired reply alone instead of two replies glued together.
+        """
+        produced: list[str] = []
+        request.json_mode = True
+
+        async for chunk in self.chat.stream(request, model_config_id=model.id):
+            if chunk.text:
+                produced.append(chunk.text)
+                yield AIStreamEvent(type="delta", text=chunk.text)
+            if chunk.usage is not None:
+                out.usage = chunk.usage
+
+        out.text = "".join(produced)
+        if parse_json_object(out.text) is not None:
+            return
+
+        # The repair re-sends the whole answer; without this frame the client
+        # would splice the two replies into one unparseable string.
+        yield AIStreamEvent(type="reset")
+        data, text, usage = await self._repair_json(model, request, out.text, out.usage)
+        out.usage = usage
+        if text:
+            out.text = text
+            yield AIStreamEvent(type="delta", text=text)
+        elif data is None:  # pragma: no cover - defensive, text is never blank here
+            return
+
+    async def _repair_json(
+        self, model: ModelConfig, request: LLMRequest, text: str, usage: LLMUsage
+    ) -> tuple[dict[str, Any] | None, str, LLMUsage]:
+        """Ask once more, non-streamed, when the streamed reply was not JSON.
+
+        Token usage of both attempts is merged so the task row bills the whole
+        conversation the author paid for.
+        """
+        repair = LLMRequest(
+            model=request.model,
+            messages=[
+                *request.messages,
+                ChatMessage(role="assistant", content=text),
+                ChatMessage(role="user", content=REPAIR_INSTRUCTION),
+            ],
+            temperature=request.temperature,
+            top_p=request.top_p,
+            max_tokens=request.max_tokens,
+            json_mode=True,
+        )
+        reply = await complete_json(self.chat, repair, retries=0, model_config_id=model.id)
+        merged = LLMUsage(
+            input_tokens=usage.input_tokens + reply.usage.input_tokens,
+            output_tokens=usage.output_tokens + reply.usage.output_tokens,
+        )
+        return reply.data, reply.text, merged
+
+    def preflight_summary(self, project_id: str, chapter_id: str) -> None:
+        """Raise ``NotFound`` / ``ValidationFailed`` **before** an SSE stream starts."""
+        self.novels.get_chapter(project_id, chapter_id)
+        self._resolve_model("summary", None)
+
+    def preflight_outline(self, project_id: str, chapter_id: str) -> None:
+        """Raise ``NotFound`` / ``ValidationFailed`` **before** an SSE stream starts."""
+        self.projects.get(project_id)
+        self.novels.get_chapter(project_id, chapter_id)
+        self._resolve_model("outline_persist", None)
+
+    # ------------------------------------------------------------------
     # L1 memory: chapter summaries
     # ------------------------------------------------------------------
     async def summarize_chapter(
@@ -388,6 +487,126 @@ class AIService:
             chars=len(parsed["summary"]),
         )
         return {"chapter_id": chapter_id, "summary": parsed["summary"], "cached": False}
+
+    async def stream_summary(
+        self,
+        project_id: str,
+        chapter_id: str,
+        *,
+        force: bool = False,
+        model_config_id: str | None = None,
+    ) -> AsyncIterator[AIStreamEvent]:
+        """Streaming twin of :meth:`summarize_chapter`.
+
+        Same prompt, same table write, same ``done`` payload (plus ``usage``);
+        the only difference is that the reply arrives as ``delta`` frames, so the
+        author sees progress instead of a 100-second blank screen.
+        """
+        chapter = self.novels.get_chapter(project_id, chapter_id)
+        content = (chapter.content or "").strip()
+        if not content:
+            yield AIStreamEvent(
+                type="done",
+                data={
+                    "chapter_id": chapter_id,
+                    "summary": "",
+                    "cached": False,
+                    "skipped": "empty",
+                    "usage": _usage_dict(LLMUsage()),
+                },
+            )
+            return
+
+        existing = self._summary_row(project_id, chapter_id)
+        if existing is not None and existing.summary and not force:
+            yield AIStreamEvent(
+                type="done",
+                data={
+                    "chapter_id": chapter_id,
+                    "summary": existing.summary,
+                    "cached": True,
+                    "skipped": None,
+                    "usage": _usage_dict(LLMUsage()),
+                },
+            )
+            return
+
+        model = self._resolve_model("summary", model_config_id)
+        messages, missing = self._summary_messages(chapter.title, content, model)
+        if missing:
+            logger.warning(
+                "prompt_variables_missing",
+                prompt_key=SUMMARY_PROMPT_KEY,
+                missing=missing,
+            )
+
+        payload = AIRequest(project_id=project_id, chapter_id=chapter_id)
+        task_id = self._start_task("summary", payload, model, SUMMARY_PROMPT_KEY)
+        request = self._llm_request(payload, messages, model)
+        reply = _Streamed()
+        settled = False
+
+        try:
+            async for event in self._stream_json(model, request, reply):
+                yield event
+            parsed = _summary_payload(reply.text, parse_json_object(reply.text))
+            self._finish_task(
+                task_id,
+                text=reply.text,
+                model=model,
+                prompt_key=SUMMARY_PROMPT_KEY,
+                usage=reply.usage,
+            )
+            settled = True
+            self._write_summary(project_id, chapter_id, parsed, model.id)
+            logger.info(
+                "chapter_summary_saved",
+                project_id=project_id,
+                chapter_id=chapter_id,
+                chars=len(parsed["summary"]),
+                streamed=True,
+            )
+            yield AIStreamEvent(
+                type="done",
+                data={
+                    "chapter_id": chapter_id,
+                    "summary": parsed["summary"],
+                    "cached": False,
+                    "skipped": None,
+                    "usage": _usage_dict(reply.usage),
+                },
+            )
+        except AllProvidersFailed as exc:
+            self._fail_task(task_id, f"所有模型均调用失败：{exc}")
+            settled = True
+            yield AIStreamEvent(
+                type="error",
+                data={
+                    "code": "all_providers_failed",
+                    "message": "所有模型都调用失败，请检查模型配置或稍后重试。",
+                    "attempts": getattr(exc, "attempts", []),
+                },
+            )
+        except LLMAdapterError as exc:
+            self._fail_task(task_id, str(exc))
+            settled = True
+            yield AIStreamEvent(
+                type="error",
+                data={"code": exc.code, "message": str(exc)},
+            )
+        except Exception as exc:
+            logger.exception("ai_summary_stream_failed", chapter_id=chapter_id)
+            self._fail_task(task_id, f"{type(exc).__name__}: {exc}")
+            settled = True
+            yield AIStreamEvent(
+                type="error",
+                data={"code": "internal_error", "message": "生成摘要时出现异常。"},
+            )
+        finally:
+            if not settled:
+                # The client hung up: a half-written JSON blob is worthless, so
+                # the task is recorded as failed rather than left "running".
+                self._fail_task(task_id, "客户端中断了流式连接")
 
     def _summary_messages(
         self, title: str, content: str, model: ModelConfig
@@ -514,6 +733,103 @@ class AIService:
             degraded=parsed["degraded"],
         )
         return result
+
+    async def stream_outline(
+        self,
+        project_id: str,
+        chapter_id: str,
+        *,
+        force: bool = False,
+        instruction: str = "",
+        model_config_id: str | None = None,
+    ) -> AsyncIterator[AIStreamEvent]:
+        """Streaming twin of :meth:`generate_outline`.
+
+        Outline generation is the slowest call in the product (103 s measured
+        against a real provider), so it is the one that most needs frames on the
+        wire. Prompt, table write and ``done`` payload are identical to the
+        non-streaming version — plus ``usage``.
+        """
+        project = self.projects.get(project_id)
+        chapter = self.novels.get_chapter(project_id, chapter_id)
+
+        existing = self._outline_row(project_id, chapter_id)
+        if existing is not None and not force and (existing["content"] or existing["goal"]):
+            yield AIStreamEvent(
+                type="done",
+                data={**existing, "usage": _usage_dict(LLMUsage())},
+            )
+            return
+
+        model = self._resolve_model("outline_persist", model_config_id)
+        messages, missing = self._outline_messages(project, chapter, instruction)
+        if missing:
+            logger.warning(
+                "prompt_variables_missing", prompt_key=OUTLINE_PROMPT_KEY, missing=missing
+            )
+
+        payload = AIRequest(
+            project_id=project_id, chapter_id=chapter_id, instruction=instruction
+        )
+        task_id = self._start_task("outline.structured", payload, model, OUTLINE_PROMPT_KEY)
+        request = self._llm_request(payload, messages, model)
+        reply = _Streamed()
+        settled = False
+
+        try:
+            async for event in self._stream_json(model, request, reply):
+                yield event
+            parsed = _outline_payload(chapter.title, reply.text, parse_json_object(reply.text))
+            self._finish_task(
+                task_id,
+                text=reply.text,
+                model=model,
+                prompt_key=OUTLINE_PROMPT_KEY,
+                usage=reply.usage,
+            )
+            settled = True
+            result = self._write_outline(project_id, chapter_id, chapter.sort_order, parsed)
+            logger.info(
+                "outline_saved",
+                project_id=project_id,
+                chapter_id=chapter_id,
+                outline_id=result["outline_id"],
+                degraded=parsed["degraded"],
+                streamed=True,
+            )
+            yield AIStreamEvent(
+                type="done",
+                data={**result, "usage": _usage_dict(reply.usage)},
+            )
+        except AllProvidersFailed as exc:
+            self._fail_task(task_id, f"所有模型均调用失败：{exc}")
+            settled = True
+            yield AIStreamEvent(
+                type="error",
+                data={
+                    "code": "all_providers_failed",
+                    "message": "所有模型都调用失败，请检查模型配置或稍后重试。",
+                    "attempts": getattr(exc, "attempts", []),
+                },
+            )
+        except LLMAdapterError as exc:
+            self._fail_task(task_id, str(exc))
+            settled = True
+            yield AIStreamEvent(
+                type="error",
+                data={"code": exc.code, "message": str(exc)},
+            )
+        except Exception as exc:
+            logger.exception("ai_outline_stream_failed", chapter_id=chapter_id)
+            self._fail_task(task_id, f"{type(exc).__name__}: {exc}")
+            settled = True
+            yield AIStreamEvent(
+                type="error",
+                data={"code": "internal_error", "message": "生成大纲时出现异常。"},
+            )
+        finally:
+            if not settled:
+                self._fail_task(task_id, "客户端中断了流式连接")
 
     def _outline_messages(
         self, project: Any, chapter: Any, instruction: str

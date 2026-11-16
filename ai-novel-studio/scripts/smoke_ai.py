@@ -53,6 +53,26 @@ def check(label: str, condition: bool, detail: str = "") -> None:
     print(f"[{'PASS' if condition else 'FAIL'}] {label}" + (f"  ({detail})" if detail and not condition else ""))
 
 
+async def drain(events, started: float):
+    """Consume one streamed generation: (deltas, done, error, text, first_at)."""
+    deltas = 0
+    done_payload: dict | None = None
+    error_payload: dict | None = None
+    parts: list[str] = []
+    first_at: float | None = None
+    async for event in events:
+        if event.type == "delta":
+            deltas += 1
+            if first_at is None:
+                first_at = time.perf_counter() - started
+            parts.append(event.text)
+        elif event.type == "done":
+            done_payload = event.data
+        else:
+            error_payload = event.data
+    return deltas, done_payload, error_payload, "".join(parts), first_at
+
+
 def spend_line(runtime: Runtime, project_id: str, kind: str, elapsed: float) -> None:
     """Print wall time plus the token usage of the newest task of *kind*."""
     task = next(
@@ -269,6 +289,44 @@ async def main_async(args: argparse.Namespace) -> int:
             check("大纲标题非空", bool((outline.get("title") or "").strip()), str(outline)[:160])
         spend_line(runtime, project.id, "ai.outline.structured", elapsed)
         print(f"  degraded={outline.get('degraded')} · 标题：{outline.get('title') or '（空）'}")
+        print()
+
+        # 4b. Streamed outline + summary (T-30) -------------------------------
+        print("→ 章节大纲（流式，强制重算）…")
+        started = time.perf_counter()
+        deltas, done, error, _text, first_at = await drain(
+            runtime.ai.stream_outline(
+                project.id, chapter.id, force=True, model_config_id=model.id
+            ),
+            started,
+        )
+        elapsed = time.perf_counter() - started
+        check("流式大纲没有报错", error is None, str(error))
+        check("流式大纲收到增量", deltas > 1, f"{deltas} 个增量")
+        check("流式大纲已落库", bool(done and done.get("outline_id")), str(done)[:160])
+        if first_at is not None:
+            print(f"  首字延迟 {first_at:.2f}s · 总耗时 {elapsed:.1f}s · {deltas} 个增量")
+        print()
+
+        print("→ 章节摘要（流式，强制重算）…")
+        started = time.perf_counter()
+        deltas, done, error, _text, first_at = await drain(
+            runtime.ai.stream_summary(
+                project.id, chapter.id, force=True, model_config_id=model.id
+            ),
+            started,
+        )
+        elapsed = time.perf_counter() - started
+        check("流式摘要没有报错", error is None, str(error))
+        check("流式摘要收到增量", deltas > 0, f"{deltas} 个增量")
+        check(
+            "流式摘要非空",
+            bool(done and (done.get("summary") or "").strip()),
+            str(done)[:160],
+        )
+        if first_at is not None:
+            print(f"  首字延迟 {first_at:.2f}s · 总耗时 {elapsed:.1f}s · {deltas} 个增量")
+        spend_line(runtime, project.id, "ai.summary", elapsed)
         print()
 
         # 5. Accept AI text, keeping the blood-line --------------------------

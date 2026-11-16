@@ -1,6 +1,6 @@
 ---
 name: novel-studio-kb-index
-description: AI Novel Studio 工程知识库唯一入口。找代码、查 API/表字段、判断阶段进度、查验证命令，全从本页进。回答「某功能在哪个文件」应直接查本库，不要先派子代理扫仓库。
+description: AI Novel Studio 工程知识库唯一入口。找代码/文件、查 API/表字段、查项目基线与依赖、判断进度、查缺陷与验证命令，全从本页进。回答「某功能在哪个文件」应直接查本库，不要先派子代理扫仓库。
 status: 现行（本页随代码更新）
 ---
 
@@ -15,12 +15,14 @@ Tauri 2 + React 19 桌面端，FastAPI + SQLite sidecar。仓库根 `ai-novel-st
 | 分区 | 内容 | 状态 |
 |---|---|---|
 | 本页 | 我该读哪几页 | ✅ |
-| [`../docs/`](../docs/) | 详版层：架构 / API / 数据库 / RAG / 工作流 / 开发计划 | ✅ 6 篇 |
-| `01_CodeMap/` | 目录 → 职责 → 关键文件、文件级清单 | ⬜ 待建 |
-| `02_Modules/` | 逐模块边界与坑 | ⬜ 待建 |
-| `04_BugsAndLessons/` | 缺陷唯一真源 `DefectRegister.md`（DEF-xx）+ `Lessons.md` | ⬜ 待建 |
-| [`05_Plan/`](05_Plan/README.md) | **进度层**：CurrentStatus / CurrentMilestone / TechnicalDebt / Roadmap / TaskRegister / handoffs | ✅ |
-| `09_Reports/ScanReports/` | 扫描报告与 `Progress.md`（进度真源） | ⬜ 待建 |
+| [`00_Project/`](00_Project/ProjectOverview.md) | 客观基线：项目概览 / 仓库地图 / 构建环境 / 第三方依赖 | ✅ 4 篇 |
+| [`01_CodeMap/`](01_CodeMap/README.md) | 代码导航：目录→职责→文件级清单（backend 56 / desktop 62 / tauri 7）+ 调用链 | ✅ 6 篇 |
+| `02_Modules/` | 逐模块边界与坑 | ⬜ 待建（小项目不照搬引擎级逐行文档） |
+| `03_ADR/` | 设计决策记录（当前取舍暂记 `05_Plan/` 与 `docs/`） | ⬜ 待建 |
+| [`04_BugsAndLessons/`](04_BugsAndLessons/README.md) | 缺陷唯一真源 `DefectRegister.md`（DEF-xx）+ `Lessons.md` | ✅ 3 篇 |
+| [`05_Plan/`](05_Plan/README.md) | **进度层**：CurrentStatus / CurrentMilestone / TechnicalDebt / Roadmap / TaskRegister / TaskPitfalls / handoffs | ✅ |
+| [`../docs/`](../docs/) | 详版层：架构 / API / 数据库 / RAG / 工作流 / 开发计划 | ✅ 7 篇 |
+| [`09_Reports/ScanReports/`](09_Reports/ScanReports/Progress.md) | **进度唯一真源** `Progress.md` + 初始扫描报告 | ✅ 2 篇 |
 
 ## 详版层：现在有什么
 
@@ -68,33 +70,37 @@ Tauri 2 + React 19 桌面端，FastAPI + SQLite sidecar。仓库根 `ai-novel-st
 | 某功能到底做完没有（带证据） | [05_Plan/CurrentStatus.md](05_Plan/CurrentStatus.md) |
 | 下一步做什么、做到什么算完 | [05_Plan/CurrentMilestone.md](05_Plan/CurrentMilestone.md) |
 | 有哪些任务待办 | [05_Plan/TaskRegister.md](05_Plan/TaskRegister.md)（**只允许 `.agents/scripts/task_queue.py` 写**） |
+| 待修复的坑及修复去向（每条坑→`T-xx`，修完即关闭） | [05_Plan/TaskPitfalls.md](05_Plan/TaskPitfalls.md)（每条带 `文件:行` 证据，行号动手前复核） |
 | 欠了什么账 | [05_Plan/TechnicalDebt.md](05_Plan/TechnicalDebt.md) |
 | 各阶段状态与版本范围 | [05_Plan/Roadmap.md](05_Plan/Roadmap.md) |
+| 缺陷（代码写错）与历史踩坑 | [04_BugsAndLessons/DefectRegister.md](04_BugsAndLessons/DefectRegister.md) · [Lessons.md](04_BugsAndLessons/Lessons.md) |
+| 构建/环境/依赖/仓库地图 | [00_Project/](00_Project/ProjectOverview.md) |
+| 某功能/某文件在哪、一次操作怎么走 | [01_CodeMap/](01_CodeMap/README.md) |
+| 知识库进度真源、AI 接手必读顺序 | [09_Reports/ScanReports/Progress.md](09_Reports/ScanReports/Progress.md) |
 
 任务驱动开发：`/task-next`（流程见 `.agents/skills/task-next/SKILL.md`）会循环「取批 → 分诊 → 派 worker → 核对」，
 状态存在 `.agents/task-state.json`，换会话可续跑。
 
 ## 验证（改完必须跑）
 
-| 命令（cwd） | 期望 |
+| 命令（cwd） | 期望（2026-11-16 实测） |
 |---|---|
-| `backend\.venv\Scripts\python.exe -m pytest -q`（backend） | `60 passed` |
-| `backend\.venv\Scripts\python.exe scripts\smoke_api.py`（仓库根） | `SMOKE PASSED: all checks green`（27 项） |
-| `backend\.venv\Scripts\python.exe scripts\smoke_ai.py --from-store`（仓库根） | `AI SMOKE PASSED`（需已配置的模型） |
-| `pnpm test`（desktop） | `29 passed (29)` |
+| `backend\.venv\Scripts\python.exe -m pytest -q`（backend） | `104 passed` |
+| `backend\.venv\Scripts\python.exe scripts\smoke_api.py`（仓库根） | `SMOKE PASSED: all checks green`（27 项；本次未跑） |
+| `backend\.venv\Scripts\python.exe scripts\smoke_ai.py --from-store`（仓库根） | `AI SMOKE PASSED`（需已配置的模型；本次未跑） |
+| `pnpm test`（desktop） | `36 passed (5 文件)` |
 | `pnpm typecheck`（desktop） | 无输出（`tsc --noEmit` 干净） |
 | `pnpm build`（desktop） | `✓ built`，产出 `dist/` |
-| `cargo check`（desktop/src-tauri） | `Finished`，无 error |
+| `cargo check`（desktop/src-tauri） | `Finished`，无 error（本次未跑） |
 
-> 用例分布：`test_ai_adapters` 13 · `test_ai_stream_e2e` 2 · `test_health` 6 ·
-> `test_migrations` 6 · `test_model_configs` 11 · `test_novels` 12 · `test_projects` 10 = 60。
-> 前端：utils 14 · text-edit 6 · ai 5 · api 4 = 29。
+> **权威数字只在 [`09_Reports/ScanReports/Progress.md` §3](09_Reports/ScanReports/Progress.md) 维护**。旧文档（AGENTS/CODEBUDDY/CurrentStatus/README）仍写 60/29、96/32 等，属待同步项。
+> 实测用例分布（2026-11-16）：后端 15 文件约 105 例（AI 相关 8 文件 49 + 其余 7 文件 56）；前端 utils 14 · ai 9 · text-edit 6 · api 4 · sidecar 3 = 36。
 
 ## 三条规则
 
 1. 动手前先查本页与对应详版页。文档与代码不符 → **改文档**（以代码为准），并把冲突记进 `09_Reports/ScanReports/Progress.md`。
 2. 新增结论必须带证据：`文件:行` 或「命令 + 期望输出」。推断标 △，无法确定的写「待确认」，不要写成事实。
-3. 缺陷只有一个真源（`04_BugsAndLessons/DefectRegister.md` 建好后）；事实型文档里最多留一行 `→ DEF-xx`，不写现象与修法。
+3. 缺陷只有一个真源（[`04_BugsAndLessons/DefectRegister.md`](04_BugsAndLessons/DefectRegister.md)，DEF-xx）；事实型文档里最多留一行 `→ DEF-xx`，不写现象与修法。未实现功能归 `T-xx`，不进 DEF。
 
 ## 文档状态约定
 

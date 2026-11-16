@@ -301,6 +301,60 @@ export interface AIResult {
   cost: number;
 }
 
+/** Body of `POST /ai/summary/{chapter_id}/stream`. */
+export interface SummaryStreamBody {
+  project_id: string;
+  /** Re-summarise even when a non-empty summary already exists. */
+  force?: boolean;
+}
+
+/** Body of `POST /ai/outline/{chapter_id}/stream`. */
+export interface OutlineStreamBody {
+  project_id: string;
+  /** Regenerate even when a usable outline row already exists. */
+  force?: boolean;
+  instruction?: string;
+}
+
+/** Token accounting attached to every streamed structured reply's `done`. */
+export interface StreamUsage {
+  input_tokens: number;
+  output_tokens: number;
+}
+
+/** `done` payload of the streamed summary call. */
+export interface SummaryStreamResult {
+  chapter_id: string;
+  summary: string;
+  cached?: boolean;
+  /** `"empty"` when the chapter body is blank and nothing was generated. */
+  skipped?: string | null;
+  usage?: StreamUsage;
+}
+
+/** `done` payload of the streamed outline call (one `outlines` row). */
+export interface OutlineStreamResult {
+  chapter_id: string;
+  outline_id?: string;
+  level?: string;
+  parent_id?: string | null;
+  title: string;
+  goal: string;
+  conflict: string;
+  characters: string[];
+  key_events: string[];
+  twists?: string;
+  foreshadows?: string[];
+  ending?: string;
+  target_word_count?: number;
+  /** Verbatim reply, kept when the model never produced JSON. */
+  content?: string;
+  /** True when the model ignored the JSON instruction and the reply is raw text. */
+  degraded: boolean;
+  cached?: boolean;
+  usage?: StreamUsage;
+}
+
 export interface AITaskSummary {
   id: string;
   project_id: string | null;

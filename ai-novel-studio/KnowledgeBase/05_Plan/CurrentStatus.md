@@ -20,7 +20,7 @@ status: 现行（每轮更新）
 | OpenAI 兼容适配器真实 HTTP 调用 | 已实现 | `ai/llm/openai_compatible.py:46,163-187` |
 | 重试（指数退避 + 可重试码分类） | 已实现 | `openai_compatible.py:37,147-161,216-232`；`errors.py:3-5` |
 | 流式输出（SSE 到前端） | 已实现 | `openai_compatible.py:234-289`；`services/ai_service.py:128-195`；`routes/ai.py:43-69`（`EventSourceResponse`） |
-| 主备降级 `fallback_ids` | 已实现（有测试） | `llm/registry.py:69-128`；`tests/test_llm_fallback.py` 9 条。**遗留缺陷**：链路只校验 primary 的 `is_active` → `T-26` |
+| 主备降级 `fallback_ids` | 已实现（有测试） | `llm/registry.py:69-128`；`tests/test_llm_fallback.py` 9 条。备模型 `is_active` 校验已补（`T-26`/DEF-12 已关闭，2026-11-16） |
 | 结构化输出（JSON 模式 + 解析 + 修复重试） | 已实现 | `ai/structured.py`：`parse_json_object` 三级解析 + `complete_json`（置 `json_mode`、修复重试一次、失败回原文降级）；6 条测试 |
 | 提示词模板（内置 + DB 双源） | 已实现 | `ai/prompts/builtin.py`（9 个，含 `memory.summary`/`outline.structured`）；`prompts/service.py` seed / DB 优先 / 渲染 |
 | 提示词版本号 | 已实现 | `prompts/service.py` 新增 `upsert_override`（写即 `version=max+1`，旧行保留）；`PATCH /api/ai/prompts/{key}` |

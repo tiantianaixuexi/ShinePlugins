@@ -15,15 +15,17 @@ status: 现行
 | [`CurrentStatus.md`](CurrentStatus.md) | 实现状态总表（按子系统），每行带证据 | 人 + agent，改代码后同步 |
 | [`CurrentMilestone.md`](CurrentMilestone.md) | 当前里程碑与验收判据 | 人 |
 | [`TaskRegister.md`](TaskRegister.md) | **任务唯一真源**（`T-xx`）。只允许 `task_queue.py` 写 | 脚本 |
+| [`TaskPitfalls.md`](TaskPitfalls.md) | 待修复坑位清单：每条坑→`T-xx` 修复去向 + `文件:行` 证据，修完在 §5 记消解 | agent 取证 |
 | [`TechnicalDebt.md`](TechnicalDebt.md) | 技术债视图，条目引用 `T-xx`，不重复描述 | 人 |
 | [`Roadmap.md`](Roadmap.md) | 7 阶段路线，只写已确定方向 | 人 |
 | [`handoffs/`](handoffs/) | 交接文档：换人/换会话时的现状快照 + 待办 | 写一次不改 |
 
 ## 什么**不**放这里
 
-- **工程事实**（代码在哪、接口怎么定、表结构）→ `../INDEX.md` 与 `../../docs/`。
-- **决策与踩坑的过程**（"为什么当时这么选"）→ `.memsearch/memory/`。
-- **已完成且不再变化的一次性产物** → `docs/archive/<年-月>/`，标注"历史快照，非现状"。
+- **客观基线 / 代码地图**（项目规模、依赖、构建、某文件在哪、调用链）→ `../00_Project/`、`../01_CodeMap/`；字段全表/推导 → `../../docs/`。
+- **代码缺陷与历史踩坑** → `../04_BugsAndLessons/`（DEF-xx / Lessons.md）；本层事实型文档最多留 `→ DEF-xx`。
+- **决策与踩坑的过程**（"为什么当时这么选"）→ `03_ADR/`（待建）与 `.memsearch/memory/`。
+- **已完成且不再变化的一次性产物** → `docs/archive/<年-月>/` 或 `../09_Reports/ScanReports/`，标注"历史快照，非现状"。
 
 判据：**"这份东西还会被改动吗？"** 会 → 计划层；不会 → archive。
 
