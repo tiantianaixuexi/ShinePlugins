@@ -1,0 +1,58 @@
+# 工作区级忽略：源码、文档、.agents/、.codebuddy/、.memsearch/memory/ 都要入库
+
+# 运行时状态（脚本维护，换会话续跑靠本地文件，不入库）
+.agents/task-state.json
+.codebuddy/defect-state.json
+
+# 依赖与构建产物（递归匹配所有子项目）
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+node_modules/
+.pnpm-store/
+.vite/
+target/
+dist/
+build/
+*.egg-info/
+.venv/
+venv/
+
+# 本地数据与密钥
+secrets.json
+NovelProjects/
+.data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# 日志与临时产物
+logs/
+tmp/
+Saved/
+exe/
+*.log
+
+# 模型权重与缓存
+.cache/
+models/
+*.onnx
+*.bin
+*.safetensors
+
+# 编辑器 / 系统
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,847 @@
+"""AI writing service.
+
+Turns a high-level request ("继续这一章") into:
+
+1. an explicit **context bundle** (system prompt + chapter outline + relevant
+   history + the current text, all inside a token budget),
+2. a chat completion against the configured model,
+3. a persisted :class:`GenerationTask` with token and cost accounting.
+
+Nothing here writes to the manuscript. Results are returned to the caller, which
+shows them for review — the author decides whether to accept them.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Any, Literal
+
+from sqlalchemy import select
+
+from app.ai.llm.errors import AllProvidersFailed, LLMAdapterError
+from app.ai.llm.registry import ChatClient
+from app.ai.llm.types import ChatMessage, LLMRequest, LLMUsage
+from app.ai.prompts.builtin import OPERATIONS, OUTLINE_PROMPT_KEY, SUMMARY_PROMPT_KEY
+from app.ai.prompts.service import PromptService, render
+from app.ai.structured import as_str_list, complete_json
+from app.core.errors import NotFound, ProviderError, ValidationFailed
+from app.core.ids import new_id
+from app.core.logging import get_logger
+from app.db.session import Database
+from app.models.novel import Chapter, ChapterSummary, Outline
+from app.models.studio import GenerationTask, ModelConfig
+from app.schemas.ai import AIRequest, AIResult
+from app.services.model_config_service import ModelConfigService
+from app.services.novel_service import NovelService
+from app.services.project_service import ProjectService
+
+logger = get_logger(__name__)
+
+#: Operations that reason over the whole chapter rather than a selection.
+WHOLE_CHAPTER_OPERATIONS = frozenset({"write", "continue", "review", "outline"})
+SELECTION_OPERATIONS = frozenset({"expand", "rewrite", "polish"})
+
+DEFAULT_TARGET_WORDS = 2000
+MAX_CONTEXT_CHARS = 24_000
+
+
+@dataclass(slots=True)
+class AIStreamEvent:
+    """One server-sent event for a streaming generation."""
+
+    type: Literal["delta", "done", "error"]
+    text: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+def _truncate(text: str, limit: int, *, from_end: bool = False) -> str:
+    """Clip *text* to *limit* characters, marking the elision."""
+    if limit <= 0 or len(text) <= limit:
+        return text
+    if from_end:
+        return f"…（前文已省略）\n{text[-limit:]}"
+    return f"{text[:limit]}\n…（后文已省略）"
+
+
+#: Short-word columns of a :class:`ChapterSummary` row.
+SUMMARY_LIST_FIELDS = ("characters", "events", "locations", "keywords", "foreshadows")
+
+
+def _summary_payload(text: str, data: dict[str, Any] | None) -> dict[str, Any]:
+    """Shape a parsed reply into the columns of a ``chapter_summaries`` row.
+
+    When the model never produced JSON we degrade to treating the whole reply as
+    the summary — a slightly noisy memory line beats losing the summary (and the
+    tokens already spent on it).
+    """
+    raw = (text or "").strip()
+    parsed: dict[str, Any] = {
+        "summary": raw,
+        "plot_progress": "",
+        **{name: [] for name in SUMMARY_LIST_FIELDS},
+    }
+    if data is None:
+        return parsed
+    parsed["summary"] = str(data.get("summary") or "").strip() or raw
+    parsed["plot_progress"] = str(data.get("plot_progress") or "").strip()
+    for name in SUMMARY_LIST_FIELDS:
+        parsed[name] = as_str_list(data.get(name))
+    return parsed
+
+
+#: Short-word columns of an :class:`Outline` row.
+OUTLINE_LIST_FIELDS = ("characters", "key_events", "foreshadows")
+#: Single-line text columns of an :class:`Outline` row.
+OUTLINE_TEXT_FIELDS = ("goal", "conflict", "twists", "ending")
+
+
+def _outline_payload(
+    chapter_title: str, text: str, data: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Shape a parsed reply into the columns of an ``outlines`` row.
+
+    A model that ignores the JSON instruction must not cost the author the
+    outline: the reply is then kept verbatim in ``content`` and the row is
+    flagged as ``degraded`` instead of raising.
+    """
+    raw = (text or "").strip()
+    parsed: dict[str, Any] = {
+        "title": (chapter_title or "").strip()[:300] or "（未命名）",
+        "content": raw,
+        **{name: "" for name in OUTLINE_TEXT_FIELDS},
+        **{name: [] for name in OUTLINE_LIST_FIELDS},
+        "target_word_count": 0,
+        "degraded": True,
+    }
+    if data is None:
+        return parsed
+    parsed["degraded"] = False
+    parsed["title"] = str(data.get("title") or "").strip()[:300] or parsed["title"]
+    for name in OUTLINE_TEXT_FIELDS:
+        parsed[name] = str(data.get(name) or "").strip()
+    for name in OUTLINE_LIST_FIELDS:
+        parsed[name] = as_str_list(data.get(name))
+    try:
+        parsed["target_word_count"] = max(0, int(data.get("target_word_count") or 0))
+    except (TypeError, ValueError):
+        parsed["target_word_count"] = 0
+    return parsed
+
+
+def _outline_result(
+    row: Outline, *, chapter_id: str, cached: bool, degraded: bool
+) -> dict[str, Any]:
+    """Serialise an :class:`Outline` row for the API while still in session."""
+    return {
+        "chapter_id": chapter_id,
+        "outline_id": row.id,
+        "level": row.level,
+        "parent_id": row.parent_id,
+        "title": row.title,
+        "goal": row.goal,
+        "conflict": row.conflict,
+        "characters": list(row.characters or []),
+        "key_events": list(row.key_events or []),
+        "twists": row.twists,
+        "foreshadows": list(row.foreshadows or []),
+        "ending": row.ending,
+        "target_word_count": row.target_word_count,
+        "content": row.content,
+        "degraded": degraded,
+        "cached": cached,
+        "row_version": row.row_version,
+    }
+
+
+class AIService:
+    def __init__(
+        self,
+        studio_db: Database,
+        projects: ProjectService,
+        model_service: ModelConfigService,
+        prompts: PromptService,
+    ) -> None:
+        self.studio_db = studio_db
+        self.projects = projects
+        self.model_service = model_service
+        self.prompts = prompts
+        self.novels = NovelService(projects)
+        self.chat = ChatClient(model_service)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def validate_operation(self, operation: str) -> str:
+        if operation not in OPERATIONS:
+            raise ValidationFailed(
+                f"未知的写作操作：{operation}",
+                details={"allowed": sorted(OPERATIONS)},
+            )
+        return operation
+
+    async def run(self, operation: str, payload: AIRequest) -> AIResult:
+        self.validate_operation(operation)
+        model = self.chat.resolve(payload.model_config_id)
+        variables = self._build_variables(operation, payload, model)
+        messages, prompt_key, missing = self.prompts.render_for(operation, variables)
+        if missing:
+            logger.warning("prompt_variables_missing", operation=operation, missing=missing)
+
+        task_id = self._start_task(operation, payload, model, prompt_key)
+        request = self._llm_request(payload, messages, model)
+
+        try:
+            response = await self.chat.complete(request, model_config_id=model.id)
+        except AllProvidersFailed as exc:
+            self._fail_task(task_id, f"所有模型均调用失败：{exc}")
+            raise ProviderError(
+                "所有模型都调用失败，请检查模型配置或稍后重试。",
+                details={"attempts": getattr(exc, "attempts", [])},
+            ) from exc
+        except LLMAdapterError as exc:
+            self._fail_task(task_id, str(exc))
+            raise ProviderError(str(exc), details={"code": exc.code}) from exc
+
+        usage = response.usage
+        self._finish_task(
+            task_id,
+            text=response.text,
+            model=model,
+            prompt_key=prompt_key,
+            usage=usage,
+        )
+        return self._result(
+            task_id, operation, response.text, response.model, prompt_key, usage, model
+        )
+
+    async def stream(self, operation: str, payload: AIRequest) -> AsyncIterator[AIStreamEvent]:
+        self.validate_operation(operation)
+        model = self.chat.resolve(payload.model_config_id)
+        variables = self._build_variables(operation, payload, model)
+        messages, prompt_key, missing = self.prompts.render_for(operation, variables)
+        if missing:
+            logger.warning("prompt_variables_missing", operation=operation, missing=missing)
+
+        task_id = self._start_task(operation, payload, model, prompt_key)
+        request = self._llm_request(payload, messages, model)
+
+        produced: list[str] = []
+        usage = LLMUsage()
+        used_model = model.model_name
+        settled = False
+
+        try:
+            async for chunk in self.chat.stream(request, model_config_id=model.id):
+                if chunk.text:
+                    produced.append(chunk.text)
+                    yield AIStreamEvent(type="delta", text=chunk.text)
+                if chunk.usage is not None:
+                    usage = chunk.usage
+            text = "".join(produced)
+            self._finish_task(task_id, text=text, model=model, prompt_key=prompt_key, usage=usage)
+            settled = True
+            yield AIStreamEvent(
+                type="done",
+                data=self._result(
+                    task_id, operation, text, used_model, prompt_key, usage, model
+                ).model_dump(),
+            )
+        except AllProvidersFailed as exc:
+            self._fail_task(task_id, f"所有模型均调用失败：{exc}")
+            settled = True
+            yield AIStreamEvent(
+                type="error",
+                data={
+                    "code": "all_providers_failed",
+                    "message": "所有模型都调用失败，请检查模型配置或稍后重试。",
+                    "attempts": getattr(exc, "attempts", []),
+                },
+            )
+        except LLMAdapterError as exc:
+            self._fail_task(task_id, str(exc))
+            settled = True
+            yield AIStreamEvent(
+                type="error",
+                data={"code": exc.code, "message": str(exc)},
+            )
+        except Exception as exc:
+            logger.exception("ai_stream_failed", operation=operation)
+            self._fail_task(task_id, f"{type(exc).__name__}: {exc}")
+            settled = True
+            yield AIStreamEvent(
+                type="error",
+                data={"code": "internal_error", "message": "生成过程中出现异常。"},
+            )
+        finally:
+            if not settled and produced:
+                # The client hung up mid-stream: keep what we generated.
+                self._finish_task(
+                    task_id,
+                    text="".join(produced),
+                    model=model,
+                    prompt_key=prompt_key,
+                    usage=usage,
+                )
+
+    # ------------------------------------------------------------------
+    # L1 memory: chapter summaries
+    # ------------------------------------------------------------------
+    async def summarize_chapter(
+        self,
+        project_id: str,
+        chapter_id: str,
+        *,
+        force: bool = False,
+        model_config_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Distil one chapter into a ``chapter_summaries`` row (L1 memory).
+
+        This is the **only** writer of that table, and it is deliberately never
+        called from the autosave path: every call is a paid model request, so it
+        runs when the author (or the memory agent) explicitly asks for it.
+        """
+        chapter = self.novels.get_chapter(project_id, chapter_id)
+        content = (chapter.content or "").strip()
+        if not content:
+            return {
+                "chapter_id": chapter_id,
+                "summary": "",
+                "cached": False,
+                "skipped": "empty",
+            }
+
+        existing = self._summary_row(project_id, chapter_id)
+        if existing is not None and existing.summary and not force:
+            return {"chapter_id": chapter_id, "summary": existing.summary, "cached": True}
+
+        model = self.chat.resolve(model_config_id)
+        messages, missing = self._summary_messages(chapter.title, content, model)
+        if missing:
+            logger.warning(
+                "prompt_variables_missing",
+                prompt_key=SUMMARY_PROMPT_KEY,
+                missing=missing,
+            )
+
+        payload = AIRequest(project_id=project_id, chapter_id=chapter_id)
+        task_id = self._start_task("summary", payload, model, SUMMARY_PROMPT_KEY)
+        request = self._llm_request(payload, messages, model)
+
+        try:
+            reply = await complete_json(self.chat, request, model_config_id=model.id)
+        except AllProvidersFailed as exc:
+            self._fail_task(task_id, f"所有模型均调用失败：{exc}")
+            raise ProviderError(
+                "所有模型都调用失败，请检查模型配置或稍后重试。",
+                details={"attempts": getattr(exc, "attempts", [])},
+            ) from exc
+        except LLMAdapterError as exc:
+            self._fail_task(task_id, str(exc))
+            raise ProviderError(str(exc), details={"code": exc.code}) from exc
+
+        self._finish_task(
+            task_id,
+            text=reply.text,
+            model=model,
+            prompt_key=SUMMARY_PROMPT_KEY,
+            usage=reply.usage,
+        )
+        parsed = _summary_payload(reply.text, reply.data)
+        self._write_summary(project_id, chapter_id, parsed, model.id)
+        logger.info(
+            "chapter_summary_saved",
+            project_id=project_id,
+            chapter_id=chapter_id,
+            chars=len(parsed["summary"]),
+        )
+        return {"chapter_id": chapter_id, "summary": parsed["summary"], "cached": False}
+
+    def _summary_messages(
+        self, title: str, content: str, model: ModelConfig
+    ) -> tuple[list[dict[str, str]], list[str]]:
+        spec = self.prompts.resolve(SUMMARY_PROMPT_KEY)
+        variables = {
+            "chapter_title": title or "（未命名）",
+            "context": _truncate(content, self._context_budget(model)),
+        }
+        system_text, system_missing = render(spec.system, variables)
+        user_text, user_missing = render(spec.user, variables)
+        messages = [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text},
+        ]
+        return messages, sorted(set(system_missing + user_missing))
+
+    def _summary_row(self, project_id: str, chapter_id: str) -> ChapterSummary | None:
+        database = self.novels.database_for(project_id)
+        with database.session() as session:
+            return session.scalar(
+                select(ChapterSummary).where(ChapterSummary.chapter_id == chapter_id)
+            )
+
+    def _write_summary(
+        self,
+        project_id: str,
+        chapter_id: str,
+        parsed: dict[str, Any],
+        model_config_id: str | None,
+    ) -> None:
+        """Upsert by ``chapter_id`` (the column is unique)."""
+        prompt_version = self._prompt_version(SUMMARY_PROMPT_KEY)
+        database = self.novels.database_for(project_id)
+        with database.session() as session:
+            row = session.scalar(
+                select(ChapterSummary).where(ChapterSummary.chapter_id == chapter_id)
+            )
+            if row is None:
+                row = ChapterSummary(
+                    id=new_id("sum"),
+                    project_id=project_id,
+                    chapter_id=chapter_id,
+                )
+                session.add(row)
+            row.summary = parsed["summary"]
+            for name in SUMMARY_LIST_FIELDS:
+                setattr(row, name, parsed[name])
+            row.plot_progress = parsed["plot_progress"]
+            row.model_config_id = model_config_id
+            row.prompt_version = prompt_version
+
+    # ------------------------------------------------------------------
+    # L1 outlines: structured, persisted chapter outlines
+    # ------------------------------------------------------------------
+    async def generate_outline(
+        self,
+        project_id: str,
+        chapter_id: str,
+        *,
+        force: bool = False,
+        instruction: str = "",
+        model_config_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Generate one chapter outline and **write it to ``outlines``**.
+
+        The toolbar's ``outline`` operation returns free text for the editor (the
+        front-end still relies on that). This method is the structured variant:
+        it asks for JSON and upserts a row keyed by
+        ``(project_id, level="chapter", parent_id=chapter_id)``, so a chapter
+        always has at most one outline row no matter how often it is regenerated.
+
+        A reply that never parses as JSON is **not** an error: the raw text is
+        stored in ``content`` and the result is flagged ``degraded``.
+        """
+        project = self.projects.get(project_id)
+        chapter = self.novels.get_chapter(project_id, chapter_id)
+
+        existing = self._outline_row(project_id, chapter_id)
+        if existing is not None and not force and (existing["content"] or existing["goal"]):
+            return existing
+
+        model = self.chat.resolve(model_config_id)
+        messages, missing = self._outline_messages(project, chapter, instruction)
+        if missing:
+            logger.warning(
+                "prompt_variables_missing", prompt_key=OUTLINE_PROMPT_KEY, missing=missing
+            )
+
+        payload = AIRequest(
+            project_id=project_id, chapter_id=chapter_id, instruction=instruction
+        )
+        task_id = self._start_task("outline.structured", payload, model, OUTLINE_PROMPT_KEY)
+        request = self._llm_request(payload, messages, model)
+
+        try:
+            reply = await complete_json(self.chat, request, model_config_id=model.id)
+        except AllProvidersFailed as exc:
+            self._fail_task(task_id, f"所有模型均调用失败：{exc}")
+            raise ProviderError(
+                "所有模型都调用失败，请检查模型配置或稍后重试。",
+                details={"attempts": getattr(exc, "attempts", [])},
+            ) from exc
+        except LLMAdapterError as exc:
+            self._fail_task(task_id, str(exc))
+            raise ProviderError(str(exc), details={"code": exc.code}) from exc
+
+        self._finish_task(
+            task_id,
+            text=reply.text,
+            model=model,
+            prompt_key=OUTLINE_PROMPT_KEY,
+            usage=reply.usage,
+        )
+        parsed = _outline_payload(chapter.title, reply.text, reply.data)
+        result = self._write_outline(
+            project_id, chapter_id, chapter.sort_order, parsed
+        )
+        logger.info(
+            "outline_saved",
+            project_id=project_id,
+            chapter_id=chapter_id,
+            outline_id=result["outline_id"],
+            degraded=parsed["degraded"],
+        )
+        return result
+
+    def _outline_messages(
+        self, project: Any, chapter: Any, instruction: str
+    ) -> tuple[list[dict[str, str]], list[str]]:
+        summaries = self._recent_summaries(project.id, chapter.id)
+        variables = {
+            "novel_type": project.novel_type or "",
+            "synopsis": project.synopsis or "",
+            "context": "\n".join(summaries) if summaries else "（暂无前情提要）",
+            "outline": (chapter.summary or "").strip() or "（暂无既有大纲，请自行设计）",
+            "instruction": instruction.strip() or "（无特殊要求）",
+        }
+        spec = self.prompts.resolve(OUTLINE_PROMPT_KEY)
+        system_text, system_missing = render(spec.system, variables)
+        user_text, user_missing = render(spec.user, variables)
+        messages = [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text},
+        ]
+        return messages, sorted(set(system_missing + user_missing))
+
+    def _outline_row(self, project_id: str, chapter_id: str) -> dict[str, Any] | None:
+        """Existing chapter-level outline for *chapter_id*, already serialised."""
+        database = self.novels.database_for(project_id)
+        with database.session() as session:
+            row = session.scalar(
+                select(Outline).where(
+                    Outline.project_id == project_id,
+                    Outline.level == "chapter",
+                    Outline.parent_id == chapter_id,
+                )
+            )
+            if row is None:
+                return None
+            return _outline_result(
+                row,
+                chapter_id=chapter_id,
+                cached=True,
+                degraded=not (row.goal or row.key_events),
+            )
+
+    def _write_outline(
+        self,
+        project_id: str,
+        chapter_id: str,
+        sort_order: int,
+        parsed: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Upsert by ``(project_id, level, parent_id)``; bump ``row_version``."""
+        database = self.novels.database_for(project_id)
+        with database.session() as session:
+            row = session.scalar(
+                select(Outline).where(
+                    Outline.project_id == project_id,
+                    Outline.level == "chapter",
+                    Outline.parent_id == chapter_id,
+                )
+            )
+            if row is None:
+                row = Outline(
+                    id=new_id("out"),
+                    project_id=project_id,
+                    level="chapter",
+                    parent_id=chapter_id,
+                )
+                session.add(row)
+            else:
+                row.row_version += 1
+            row.sort_order = sort_order
+            row.title = parsed["title"]
+            row.content = parsed["content"]
+            for name in OUTLINE_TEXT_FIELDS:
+                setattr(row, name, parsed[name])
+            for name in OUTLINE_LIST_FIELDS:
+                setattr(row, name, parsed[name])
+            row.target_word_count = parsed["target_word_count"]
+            session.flush()
+            return _outline_result(
+                row, chapter_id=chapter_id, cached=False, degraded=parsed["degraded"]
+            )
+
+    # ------------------------------------------------------------------
+    # Context assembly
+    # ------------------------------------------------------------------
+    def _context_budget(self, model: ModelConfig) -> int:
+        """Characters of manuscript the prompt may contain."""
+        window = max(model.context_window, 4096)
+        # Leave room for the system prompt, the answer and provider overhead.
+        budget = int(window * 0.45)
+        return max(1_000, min(budget, MAX_CONTEXT_CHARS))
+
+    def _build_variables(
+        self, operation: str, payload: AIRequest, model: ModelConfig
+    ) -> dict[str, str]:
+        project = self.projects.get(payload.project_id)
+        budget = self._context_budget(model)
+
+        chapter = None
+        content = payload.content or ""
+        if payload.chapter_id:
+            chapter = self.novels.get_chapter(payload.project_id, payload.chapter_id)
+            content = chapter.content or content
+
+        sections: list[str] = []
+
+        if operation in ("write", "outline"):
+            summaries = self._recent_summaries(payload.project_id, payload.chapter_id)
+            if summaries:
+                sections.append("【前情提要】\n" + "\n".join(summaries))
+
+        if operation in WHOLE_CHAPTER_OPERATIONS:
+            if content:
+                if operation == "continue":
+                    sections.append(
+                        "【已有正文（结尾）】\n" + _truncate(content, budget, from_end=True)
+                    )
+                else:
+                    sections.append("【当前正文】\n" + _truncate(content, budget))
+        elif operation in SELECTION_OPERATIONS and content:
+            sections.append("【所在章节（供参考）】\n" + _truncate(content, budget // 3))
+
+        context = "\n\n".join(sections)
+
+        outline = payload.outline or (chapter.summary if chapter is not None else "")
+        selection = payload.selection or payload.content
+
+        characters = ""
+        events = ""
+        if operation == "review":
+            characters = self._characters_digest(payload.project_id)
+            events = self._events_digest(payload.project_id)
+
+        return {
+            "novel_type": project.novel_type or "",
+            "synopsis": project.synopsis or "",
+            "context": context,
+            "outline": outline,
+            "selection": selection,
+            "instruction": payload.instruction or "（无特殊要求）",
+            "target_words": str(payload.target_words or DEFAULT_TARGET_WORDS),
+            "characters": characters,
+            "events": events,
+        }
+
+    def _recent_summaries(
+        self, project_id: str, chapter_id: str | None, limit: int = 5
+    ) -> list[str]:
+        database = self.novels.database_for(project_id)
+        with database.session() as session:
+            rows = list(
+                session.scalars(
+                    select(ChapterSummary)
+                    .join(Chapter, Chapter.id == ChapterSummary.chapter_id)
+                    .where(
+                        ChapterSummary.project_id == project_id,
+                        Chapter.is_deleted.is_(False),
+                    )
+                    .order_by(Chapter.sort_order.desc())
+                    .limit(limit)
+                )
+            )
+        summaries = [row.summary for row in reversed(rows) if row.summary]
+        if not summaries:
+            return []
+        return [f"- {summary}" for summary in summaries]
+
+    def _characters_digest(self, project_id: str, limit: int = 12) -> str:
+        from app.models.novel import Character
+
+        database = self.novels.database_for(project_id)
+        with database.session() as session:
+            rows = list(
+                session.scalars(
+                    select(Character)
+                    .where(
+                        Character.project_id == project_id,
+                        Character.is_deleted.is_(False),
+                    )
+                    .limit(limit)
+                )
+            )
+        if not rows:
+            return "（未录入人物）"
+        lines = []
+        for row in rows:
+            state = row.current_state or {}
+            location = state.get("location") if isinstance(state, dict) else None
+            parts = [row.name]
+            if row.identity:
+                parts.append(f"身份：{row.identity}")
+            if location:
+                parts.append(f"所在地：{location}")
+            if row.personality:
+                parts.append(f"性格：{row.personality[:60]}")
+            lines.append("- " + "；".join(str(part) for part in parts if part))
+        return "\n".join(lines)
+
+    def _events_digest(self, project_id: str, limit: int = 10) -> str:
+        from app.models.novel import Event
+
+        database = self.novels.database_for(project_id)
+        with database.session() as session:
+            rows = list(
+                session.scalars(
+                    select(Event)
+                    .where(Event.project_id == project_id)
+                    .order_by(Event.sort_order.desc())
+                    .limit(limit)
+                )
+            )
+        if not rows:
+            return "（未录入事件）"
+        return "\n".join(f"- {row.name}：{row.description[:80]}" for row in reversed(rows))
+
+    # ------------------------------------------------------------------
+    # Request helpers
+    # ------------------------------------------------------------------
+    def _llm_request(
+        self, payload: AIRequest, messages: list[dict[str, str]], model: ModelConfig
+    ) -> LLMRequest:
+        temperature = payload.temperature if payload.temperature is not None else model.temperature
+        return LLMRequest(
+            model=model.model_name,
+            messages=[ChatMessage(role=msg["role"], content=msg["content"]) for msg in messages],  # type: ignore[arg-type]
+            temperature=temperature,
+            top_p=model.top_p,
+            max_tokens=min(model.max_tokens, max(model.max_output_tokens, 256)),
+            json_mode=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Task bookkeeping
+    # ------------------------------------------------------------------
+    def _start_task(
+        self, operation: str, payload: AIRequest, model: ModelConfig, prompt_key: str
+    ) -> str:
+        task_id = new_id("tsk")
+        with self.studio_db.session() as session:
+            session.add(
+                GenerationTask(
+                    id=task_id,
+                    project_id=payload.project_id,
+                    kind=f"ai.{operation}",
+                    status="running",
+                    model_config_id=model.id,
+                    payload={
+                        "chapter_id": payload.chapter_id,
+                        "operation": operation,
+                        "instruction": payload.instruction[:500],
+                        "target_words": payload.target_words,
+                    },
+                    result={},
+                    prompt_version=self._prompt_version(prompt_key),
+                    started_at=datetime.now(UTC),
+                )
+            )
+        return task_id
+
+    def _prompt_version(self, prompt_key: str) -> int | None:
+        try:
+            spec = self.prompts.resolve(prompt_key)
+        except KeyError:  # pragma: no cover - defensive
+            return None
+        with self.studio_db.session() as session:
+            from app.models.studio import PromptTemplate
+
+            row = session.scalar(
+                select(PromptTemplate)
+                .where(PromptTemplate.key == spec.key)
+                .order_by(PromptTemplate.version.desc())
+            )
+        return row.version if row else None
+
+    def _finish_task(
+        self,
+        task_id: str,
+        *,
+        text: str,
+        model: ModelConfig,
+        prompt_key: str,
+        usage: LLMUsage,
+    ) -> None:
+        cost = (
+            usage.input_tokens * model.input_price_per_1m
+            + usage.output_tokens * model.output_price_per_1m
+        ) / 1_000_000
+        with self.studio_db.session() as session:
+            task = session.get(GenerationTask, task_id)
+            if task is None:  # pragma: no cover - task rows are never deleted here
+                return
+            task.status = "success"
+            task.input_tokens = usage.input_tokens
+            task.output_tokens = usage.output_tokens
+            task.cost = round(cost, 6)
+            task.result = {
+                "prompt_key": prompt_key,
+                "model": model.model_name,
+                "chars": len(text),
+                "preview": text[:200],
+            }
+            task.finished_at = datetime.now(UTC)
+        logger.info(
+            "ai_task_finished",
+            task_id=task_id,
+            model=model.model_name,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cost=round(cost, 6),
+        )
+
+    def _fail_task(self, task_id: str, message: str) -> None:
+        with self.studio_db.session() as session:
+            task = session.get(GenerationTask, task_id)
+            if task is None:  # pragma: no cover
+                return
+            task.status = "failed"
+            task.error = message[:2000]
+            task.finished_at = datetime.now(UTC)
+        logger.warning("ai_task_failed", task_id=task_id, error=message)
+
+    def _result(
+        self,
+        task_id: str,
+        operation: str,
+        text: str,
+        model: str,
+        prompt_key: str,
+        usage: LLMUsage,
+        config: ModelConfig,
+    ) -> AIResult:
+        cost = (
+            usage.input_tokens * config.input_price_per_1m
+            + usage.output_tokens * config.output_price_per_1m
+        ) / 1_000_000
+        return AIResult(
+            task_id=task_id,
+            operation=operation,
+            text=text,
+            model=model,
+            prompt_key=prompt_key,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cost=round(cost, 6),
+        )
+
+    # ------------------------------------------------------------------
+    # Task history
+    # ------------------------------------------------------------------
+    def list_tasks(self, *, project_id: str | None = None, limit: int = 50) -> list[GenerationTask]:
+        with self.studio_db.session() as session:
+            statement = select(GenerationTask).order_by(GenerationTask.created_at.desc())
+            if project_id:
+                statement = statement.where(GenerationTask.project_id == project_id)
+            statement = statement.where(GenerationTask.kind.like("ai.%"))
+            return list(session.scalars(statement.limit(limit)))
+
+    def get_task(self, task_id: str) -> GenerationTask:
+        with self.studio_db.session() as session:
+            task = session.get(GenerationTask, task_id)
+            if task is None:
+                raise NotFound(f"Task {task_id} not found")
+            return task

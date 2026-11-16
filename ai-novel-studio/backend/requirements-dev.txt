@@ -1,0 +1,11 @@
+# Development / test dependencies (includes the runtime set).
+-r requirements.txt
+
+# Test
+pytest==9.2.0
+pytest-asyncio==1.5.0
+
+# Quality
+ruff==0.17.5
+mypy==2.4.1
+types-pyyaml==6.0.12.20261113

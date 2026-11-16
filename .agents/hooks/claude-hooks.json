@@ -1,0 +1,28 @@
+{
+  "description": "memsearch 记忆层：会话结束落盘原始片段并增量索引；用户提问时可选择性自动召回。合入 .claude/settings.json 的 \"hooks\" 键即可（其他工具见 .agents/README.md）。",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/.agents/skills/memsearch/scripts/capture.py\"",
+            "timeout": 90
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/.agents/skills/memsearch/scripts/recall.py\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
